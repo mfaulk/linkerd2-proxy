@@ -6,18 +6,13 @@ use std::sync::{Arc, Weak};
 
 use super::iface::Tap;
 
-/// The number of pending registrations that may be buffered.
-const REGISTER_BUFFER_CAPACITY: usize = 16;
+const SERVICE_CAPACITY: usize = 10_000;
 
-/// The number of pending taps that may be buffered.
-const TAP_BUFFER_CAPACITY: usize = 16;
-
-/// The number of tap requests a given layer may buffer before consuming.
-const REGISTER_TAPS_BUFFER_CAPACITY: usize = 16;
+const TAP_CAPACITY: usize = 1_000;
 
 pub fn new<T>() -> (Daemon<T>, Register<T>, Subscribe<T>) {
-    let (svc_tx, svc_rx) = mpsc::channel(REGISTER_BUFFER_CAPACITY);
-    let (tap_tx, tap_rx) = mpsc::channel(TAP_BUFFER_CAPACITY);
+    let (svc_tx, svc_rx) = mpsc::channel(SERVICE_CAPACITY);
+    let (tap_tx, tap_rx) = mpsc::channel(TAP_CAPACITY);
 
     let daemon = Daemon {
         svc_rx,
@@ -53,10 +48,14 @@ impl<T: Tap> Future for Daemon<T> {
     fn poll(&mut self) -> Poll<(), Never> {
         // Drop taps that are no longer active (i.e. the response stream has
         // been droped).
+        let tap_count = self.taps.len();
         self.taps.retain(|t| t.can_tap_more());
+        trace!("retained {} of {} taps", self.taps.len(), tap_count);
 
         // Connect newly-created services to active taps.
         while let Ok(Async::Ready(Some(mut svc))) = self.svc_rx.poll() {
+            trace!("registering a service");
+
             // Notify the service of all active taps. If there's an error, the
             // registration is dropped.
             let mut is_ok = true;
@@ -68,11 +67,13 @@ impl<T: Tap> Future for Daemon<T> {
 
             if is_ok {
                 self.svcs.push_back(svc);
+                trace!("service registered");
             }
         }
 
         // Connect newly-created taps to existing services.
         while let Ok(Async::Ready(Some(t))) = self.tap_rx.poll() {
+            trace!("subscribing a tap");
             if !t.can_tap_more() {
                 continue;
             }
@@ -83,11 +84,13 @@ impl<T: Tap> Future for Daemon<T> {
             // it is removed from the registry.
             for idx in (0..self.svcs.len()).rev() {
                 if self.svcs[idx].try_send(Arc::downgrade(&tap)).is_err() {
+                    trace!("removing a service");
                     self.svcs.swap_remove_back(idx);
                 }
             }
 
             self.taps.push_back(tap);
+            trace!("tap subscribed");
         }
 
         Ok(Async::NotReady)
@@ -105,8 +108,10 @@ impl<T: Tap> super::iface::Register for Register<T> {
     type Taps = mpsc::Receiver<Weak<T>>;
 
     fn register(&mut self) -> Self::Taps {
-        let (tx, rx) = mpsc::channel(REGISTER_TAPS_BUFFER_CAPACITY);
-        let _ = self.0.try_send(tx);
+        let (tx, rx) = mpsc::channel(TAP_CAPACITY);
+        if let Err(_) = self.0.try_send(tx) {
+            debug!("failed to register service");
+        }
         rx
     }
 }
@@ -119,6 +124,8 @@ impl<T: Tap> Clone for Subscribe<T> {
 
 impl<T: Tap> super::iface::Subscribe<T> for Subscribe<T> {
     fn subscribe(&mut self, tap: T) {
-        let _ = self.0.try_send(tap);
+        if let Err(_) = self.0.try_send(tap) {
+            debug!("failed to subscribe tap");
+        }
     }
 }

@@ -165,7 +165,10 @@ where
         let taps = self.taps.drain(..).map(|t| t.tap(&rsp)).collect();
         let rsp = {
             let (head, inner) = rsp.into_parts();
-            let body = Body { inner, taps };
+            let mut body = Body { inner, taps };
+            if body.is_end_stream() {
+                body.eos(None);
+            }
             http::Response::from_parts(head, body)
         };
 
@@ -210,13 +213,7 @@ impl<B: Payload, T: TapBody> Payload for Body<B, T> {
     fn poll_data(&mut self) -> Poll<Option<Self::Data>, h2::Error> {
         let poll_frame = self.inner.poll_data().map_err(|e| self.err(e));
         let frame = try_ready!(poll_frame).map(|f| f.into_buf());
-
-        if let Some(ref f) = frame.as_ref() {
-            for ref mut tap in self.taps.iter_mut() {
-                tap.data::<Self::Data>(f);
-            }
-        }
-
+        self.data(frame.as_ref());
         Ok(Async::Ready(frame))
     }
 
@@ -228,13 +225,28 @@ impl<B: Payload, T: TapBody> Payload for Body<B, T> {
 }
 
 impl<B: Payload, T: TapBody> Body<B, T> {
+    fn data(&mut self, frame: Option<&<B::Data as IntoBuf>::Buf>) {
+        trace!("tapping data frame");
+        if let Some(ref f) = frame {
+            for ref mut tap in self.taps.iter_mut() {
+                tap.data::<<B::Data as IntoBuf>::Buf>(f);
+            }
+        }
+
+        if self.inner.is_end_stream() {
+            self.eos(None);
+        }
+    }
+
     fn eos(&mut self, trailers: Option<&http::HeaderMap>) {
+        trace!("tapping eos");
         for tap in self.taps.drain(..) {
             tap.eos(trailers);
         }
     }
 
     fn err(&mut self, error: h2::Error) -> h2::Error {
+        trace!("tapping error: {}", error);
         for tap in self.taps.drain(..) {
             tap.fail(&error);
         }
@@ -245,6 +257,7 @@ impl<B: Payload, T: TapBody> Body<B, T> {
 
 impl<B: Payload, T: TapBody> Drop for Body<B, T> {
     fn drop(&mut self) {
+        trace!("dropping tap body");
         // TODO this should be recorded as a cancelation if the stream didn't end.
         self.eos(None);
     }

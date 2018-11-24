@@ -70,10 +70,10 @@ impl<T: iface::Subscribe<Tap>> Server<T> {
         Self { base_id, subscribe }
     }
 
-    fn invalid_arg(msg: http::header::HeaderValue) -> grpc::Error {
+    fn invalid_arg(event: http::header::HeaderValue) -> grpc::Error {
         let status = grpc::Status::with_code(grpc::Code::InvalidArgument);
         let mut headers = HeaderMap::new();
-        headers.insert("grpc-message", msg);
+        headers.insert("grpc-message", event);
         grpc::Error::Grpc(status, headers)
     }
 }
@@ -88,25 +88,20 @@ where
     fn observe(&mut self, req: grpc::Request<api::ObserveRequest>) -> Self::ObserveFuture {
         let req = req.into_inner();
 
-        let limit = match req.limit as usize {
-            0 => {
-                let v = http::header::HeaderValue::from_static("limit must be positive");
-                return future::err(Self::invalid_arg(v));
-            }
-            n if n == ::std::usize::MAX => {
-                let v = http::header::HeaderValue::from_static("limit is too large");
-                return future::err(Self::invalid_arg(v));
-            }
-            n => n,
+        let limit = req.limit as usize;
+        if limit == 0 {
+            let v = http::header::HeaderValue::from_static("limit must be positive");
+            return future::err(Self::invalid_arg(v));
         };
+        trace!("tap: limit={}", limit);
 
         let match_ = match Match::try_new(req.match_) {
             Ok(m) => m,
             Err(e) => {
+                warn!("invalid tap request: {} ", e);
                 let v = format!("{}", e)
                     .parse()
-                    .or_else(|_| "invalid message".parse())
-                    .unwrap();
+                    .unwrap_or_else(|_| http::header::HeaderValue::from_static("invalid message"));
                 return future::err(Self::invalid_arg(v));
             }
         };
@@ -114,7 +109,7 @@ where
         // Wrapping is okay. This is realy just to disambiguate events within a
         // single tap session (i.e. that may consist of several tap requests).
         let base_id = self.base_id.fetch_add(1, Ordering::AcqRel) as u32;
-        info!("tap: id={}; match={:?}", base_id, match_);
+        debug!("tap; id={}; match={:?}", base_id, match_);
 
         let (tx, rx) = mpsc::channel(PER_REQUEST_BUFFER_CAPACITY);
         let _handle = Arc::new(());
@@ -129,7 +124,11 @@ impl Stream for ResponseStream {
     type Error = grpc::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        self.rx.poll().or_else(|_| Ok(None.into()))
+        let poll: Poll<Option<Self::Item>, Self::Error> =
+            self.rx.poll().or_else(|_| Ok(None.into()));
+        let event = try_ready!(poll);
+        trace!("ResponseStream::poll: event={:?}", event);
+        Ok(event.into())
     }
 }
 
@@ -195,25 +194,27 @@ impl iface::Tap for Tap {
         let request_init_at = clock::now();
 
         if !self.match_.matches(&req, inspect) {
+            trace!("request does not match; tap={}", self.base_id);
             return None;
         }
 
         let n = self.count.fetch_add(1, Ordering::AcqRel);
         if n >= self.limit {
+            debug!("tap exhausted; tap={}", self.base_id);
             return None;
         }
-
-        // All of the events emitted from tap have a common set of metadata.
-        // Build this once, without an `event`, so that it can be used to build
-        // each HTTP event.
-        let base_event = Self::base_event(req, inspect);
 
         let id = api::tap_event::http::StreamId {
             base: self.base_id,
             stream: n as u64,
         };
+        trace!("request matches tap; id={}:{}", id.base, id.stream);
 
-        let msg = api::TapEvent {
+        // All of the events emitted from tap have a common set of metadata.
+        // Build this once, without an `event`, so that it can be used to build
+        // each HTTP event.
+        let base_event = Self::base_event(req, inspect);
+        let event = api::TapEvent {
             event: Some(api::tap_event::Event::Http(api::tap_event::Http {
                 event: Some(api::tap_event::http::Event::RequestInit(
                     api::tap_event::http::RequestInit {
@@ -229,7 +230,13 @@ impl iface::Tap for Tap {
         };
 
         let mut tx = self.tx.clone();
-        tx.try_send(msg).ok()?;
+        match tx.try_send(event) {
+            Ok(()) => trace!("sent tap event; id={}:{}", id.base, id.stream),
+            Err(_) => {
+                debug!("failed to emit tap event; id={}:{}", id.base, id.stream);
+                return None;
+            }
+        }
 
         let req = TapRequestBody {
             id: id.clone(),
@@ -250,8 +257,9 @@ impl iface::TapResponse for TapResponse {
     type TapBody = TapResponseBody;
 
     fn tap<B: Payload>(mut self, rsp: &http::Response<B>) -> TapResponseBody {
+        trace!("tapping response; id={}:{}", self.id.base, self.id.stream);
         let response_init_at = clock::now();
-        let msg = api::TapEvent {
+        let event = api::TapEvent {
             event: Some(api::tap_event::Event::Http(api::tap_event::Http {
                 event: Some(api::tap_event::http::Event::ResponseInit(
                     api::tap_event::http::ResponseInit {
@@ -265,7 +273,10 @@ impl iface::TapResponse for TapResponse {
             })),
             ..self.base_event.clone()
         };
-        let _ = self.tx.try_send(msg);
+        match self.tx.try_send(event) {
+            Ok(()) => trace!("sent tap event; id={}:{}", self.id.base, self.id.stream),
+            Err(_) => debug!("failed to emit tap event; id={}:{}", self.id.base, self.id.stream),
+        }
 
         TapResponseBody {
             base_event: self.base_event,
@@ -278,11 +289,12 @@ impl iface::TapResponse for TapResponse {
     }
 
     fn fail<E: HasH2Reason>(mut self, e: &E) {
+        trace!("failing response; id={}:{}", self.id.base, self.id.stream);
         let response_end_at = clock::now();
         let end = e
             .h2_reason()
             .map(|r| api::eos::End::ResetErrorCode(r.into()));
-        let msg = api::TapEvent {
+        let event = api::TapEvent {
             event: Some(api::tap_event::Event::Http(api::tap_event::Http {
                 event: Some(api::tap_event::http::Event::ResponseEnd(
                     api::tap_event::http::ResponseEnd {
@@ -299,7 +311,10 @@ impl iface::TapResponse for TapResponse {
             ..self.base_event
         };
 
-        let _ = self.tx.try_send(msg);
+        match self.tx.try_send(event) {
+            Ok(()) => trace!("sent tap event; id={}:{}", self.id.base, self.id.stream),
+            Err(_) => debug!("failed to emit tap event; id={}:{}", self.id.base, self.id.stream),
+        }
     }
 }
 
@@ -317,25 +332,27 @@ impl iface::TapBody for TapResponseBody {
     }
 
     fn eos(self, trls: Option<&http::HeaderMap>) {
+        trace!("ending response; id={}:{}", self.id.base, self.id.stream);
         let end = trls
             .and_then(|t| t.get("grpc-status"))
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u32>().ok())
             .map(api::eos::End::GrpcStatusCode);
 
-        self.send_end(end);
+        self.send(end);
     }
 
     fn fail(self, e: &h2::Error) {
+        trace!("failing response stream; id={}:{}; error={}", self.id.base, self.id.stream, e);
         let end = e.reason().map(|r| api::eos::End::ResetErrorCode(r.into()));
-        self.send_end(end);
+        self.send(end);
     }
 }
 
 impl TapResponseBody {
-    fn send_end(mut self, end: Option<api::eos::End>) {
+    fn send(mut self, end: Option<api::eos::End>) {
         let response_end_at = clock::now();
-        let msg = api::TapEvent {
+        let event = api::TapEvent {
             event: Some(api::tap_event::Event::Http(api::tap_event::Http {
                 event: Some(api::tap_event::http::Event::ResponseEnd(
                     api::tap_event::http::ResponseEnd {
@@ -354,6 +371,9 @@ impl TapResponseBody {
             ..self.base_event
         };
 
-        let _ = self.tx.try_send(msg);
+        match self.tx.try_send(event) {
+            Ok(()) => trace!("sent tap event; id={}:{}", self.id.base, self.id.stream),
+            Err(_) => debug!("failed to emit tap event; id={}:{}", self.id.base, self.id.stream),
+        }
     }
 }
