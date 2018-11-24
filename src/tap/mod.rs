@@ -76,6 +76,10 @@ mod iface {
         type TapResponse: TapResponse<TapBody = Self::TapResponseBody>;
         type TapResponseBody: TapBody;
 
+        fn can_tap_more(&self) -> bool {
+            true
+        }
+
         fn tap<B: Payload, I: super::Inspect>(
             &self,
             req: &http::Request<B>,

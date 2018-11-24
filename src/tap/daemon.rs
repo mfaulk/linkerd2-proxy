@@ -53,7 +53,7 @@ impl<T: Tap> Future for Daemon<T> {
     fn poll(&mut self) -> Poll<(), Never> {
         // Drop taps that are no longer active (i.e. the response stream has
         // been droped).
-        self.taps.retain(|t| t.upgrade().is_some());
+        self.taps.retain(|t| t.upgrade().map(|t| t.can_tap_more()).unwrap_or(false));
 
         // Connect newly-created services to active taps.
         while let Ok(Async::Ready(Some(mut svc))) = self.svc_rx.poll() {

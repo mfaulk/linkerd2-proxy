@@ -27,8 +27,8 @@ pub struct Stack<R: Register, T> {
 /// A middleware that records HTTP taps.
 #[derive(Clone, Debug)]
 pub struct Service<I, R, S, T> {
-    subscription_rx: R,
-    subscriptions: VecDeque<Weak<S>>,
+    tap_rx: R,
+    taps: VecDeque<Weak<S>>,
     inner: T,
     inspect: I,
 }
@@ -87,11 +87,11 @@ where
 
     fn make(&self, target: &T) -> Result<Self::Value, Self::Error> {
         let inner = self.inner.make(&target)?;
-        let subscription_rx = self.registry.clone().register();
+        let tap_rx = self.registry.clone().register();
         Ok(Service {
             inner,
-            subscription_rx,
-            subscriptions: VecDeque::default(),
+            tap_rx,
+            taps: VecDeque::default(),
             inspect: target.clone(),
         })
     }
@@ -114,17 +114,18 @@ where
     type Future = ResponseFuture<T::Future, S::TapResponse>;
 
     fn poll_ready(&mut self) -> Poll<(), Self::Error> {
-        while let Ok(Async::Ready(Some(s))) = self.subscription_rx.poll() {
-            self.subscriptions.push_back(s);
+        while let Ok(Async::Ready(Some(s))) = self.tap_rx.poll() {
+            self.taps.push_back(s);
         }
-        self.subscriptions.retain(|s| s.upgrade().is_some());
+        self.taps
+            .retain(|t| t.upgrade().map(|t| t.can_tap_more()).unwrap_or(false));
         self.inner.poll_ready()
     }
 
     fn call(&mut self, req: http::Request<A>) -> Self::Future {
-        let mut req_taps = VecDeque::with_capacity(self.subscriptions.len());
-        let mut rsp_taps = VecDeque::with_capacity(self.subscriptions.len());
-        for t in self.subscriptions.iter().filter_map(Weak::upgrade) {
+        let mut req_taps = VecDeque::with_capacity(self.taps.len());
+        let mut rsp_taps = VecDeque::with_capacity(self.taps.len());
+        for t in self.taps.iter().filter_map(Weak::upgrade) {
             if let Some((req_tap, rsp_tap)) = t.tap(&req, &self.inspect) {
                 req_taps.push_back(req_tap);
                 rsp_taps.push_back(rsp_tap);

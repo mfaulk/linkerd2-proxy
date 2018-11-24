@@ -35,7 +35,7 @@ pub struct Tap {
     match_: Match,
     base_id: u32,
     count: AtomicUsize,
-    total: usize,
+    limit: usize,
 }
 
 #[derive(Debug)]
@@ -87,7 +87,7 @@ where
     fn observe(&mut self, req: grpc::Request<api::ObserveRequest>) -> Self::ObserveFuture {
         let req = req.into_inner();
 
-        let total = match req.limit as usize {
+        let limit = match req.limit as usize {
             0 => {
                 let v = http::header::HeaderValue::from_static("limit must be positive");
                 return future::err(Self::invalid_arg(v));
@@ -111,12 +111,12 @@ where
         };
 
         // Wrapping is okay. This is realy just to disambiguate events within a
-        // single tap stream.
+        // single tap session (i.e. that may consist of several tap requests).
         let base_id = self.base_id.fetch_add(1, Ordering::AcqRel) as u32;
         info!("tap: id={}; match={:?}", base_id, match_);
 
         let (tx, rx) = mpsc::channel(PER_REQUEST_BUFFER_CAPACITY);
-        let tap = Arc::new(Tap::new(base_id, tx, match_, total));
+        let tap = Arc::new(Tap::new(base_id, tx, match_, limit));
         self.subscribe.subscribe(Arc::downgrade(&tap));
         future::ok(Response::new(ResponseStream { rx, tap }))
     }
@@ -132,12 +132,12 @@ impl Stream for ResponseStream {
 }
 
 impl Tap {
-    fn new(base_id: u32, tx: mpsc::Sender<api::TapEvent>, match_: Match, total: usize) -> Self {
+    fn new(base_id: u32, tx: mpsc::Sender<api::TapEvent>, match_: Match, limit: usize) -> Self {
         Self {
             tx,
             match_,
             base_id,
-            total,
+            limit,
             count: 0.into(),
         }
     }
@@ -152,16 +152,16 @@ impl Tap {
             source: inspect.src_addr(req).as_ref().map(|a| a.into()),
             source_meta: {
                 let mut m = api::tap_event::EndpointMeta::default();
-                m.labels
-                    .insert("tls".to_owned(), format!("{}", inspect.src_tls(req)));
+                let tls = format!("{}", inspect.src_tls(req));
+                m.labels.insert("tls".to_owned(), tls);
                 Some(m)
             },
             destination: inspect.dst_addr(req).as_ref().map(|a| a.into()),
             destination_meta: inspect.dst_labels(req).map(|labels| {
                 let mut m = api::tap_event::EndpointMeta::default();
                 m.labels.extend(labels.clone());
-                m.labels
-                    .insert("tls".to_owned(), format!("{}", inspect.dst_tls(req)));
+                let tls = format!("{}", inspect.dst_tls(req));
+                m.labels.insert("tls".to_owned(), tls);
                 m
             }),
             event: None,
@@ -174,23 +174,29 @@ impl iface::Tap for Tap {
     type TapResponse = TapResponse;
     type TapResponseBody = TapResponseBody;
 
+    fn can_tap_more(&self) -> bool {
+        self.count.load(Ordering::Acquire) < self.limit
+    }
+
     fn tap<B: Payload, I: Inspect>(
         &self,
         req: &http::Request<B>,
         inspect: &I,
     ) -> Option<(TapRequestBody, TapResponse)> {
+        let request_init_at = clock::now();
+
         if !self.match_.matches(&req, inspect) {
             return None;
         }
 
         let n = self.count.fetch_add(1, Ordering::AcqRel);
-
-        // If there are no more requests to tap, drop the sender so that the
-        // receiver closes immediately.
-        if n == self.total {
+        if n >= self.limit {
             return None;
         }
 
+        // All of the events emitted from tap have a common set of metadata.
+        // Build this once, without an `event`, so that it can be used to build
+        // each HTTP event.
         let base_event = Self::base_event(req, inspect);
 
         let id = api::tap_event::http::StreamId {
@@ -198,9 +204,6 @@ impl iface::Tap for Tap {
             stream: n as u64,
         };
 
-        // If the receiver event isn't actually written to the channel,
-        // return None so that we don't do work for an unaccounted request.
-        let mut tx = self.tx.clone();
         let msg = api::TapEvent {
             event: Some(api::tap_event::Event::Http(api::tap_event::Http {
                 event: Some(api::tap_event::http::Event::RequestInit(
@@ -215,9 +218,10 @@ impl iface::Tap for Tap {
             })),
             ..base_event.clone()
         };
-        let _ = tx.try_send(msg).ok()?;
 
-        let request_init_at = clock::now();
+        let mut tx = self.tx.clone();
+        tx.try_send(msg).ok()?;
+
         let req = TapRequestBody {
             id: id.clone(),
             tx: tx.clone(),
