@@ -226,7 +226,6 @@ impl<B: Payload, T: TapBody> Payload for Body<B, T> {
 
 impl<B: Payload, T: TapBody> Body<B, T> {
     fn data(&mut self, frame: Option<&<B::Data as IntoBuf>::Buf>) {
-        trace!("tapping data frame");
         if let Some(ref f) = frame {
             for ref mut tap in self.taps.iter_mut() {
                 tap.data::<<B::Data as IntoBuf>::Buf>(f);
@@ -239,14 +238,12 @@ impl<B: Payload, T: TapBody> Body<B, T> {
     }
 
     fn eos(&mut self, trailers: Option<&http::HeaderMap>) {
-        trace!("tapping eos");
         for tap in self.taps.drain(..) {
             tap.eos(trailers);
         }
     }
 
     fn err(&mut self, error: h2::Error) -> h2::Error {
-        trace!("tapping error: {}", error);
         for tap in self.taps.drain(..) {
             tap.fail(&error);
         }
@@ -257,7 +254,6 @@ impl<B: Payload, T: TapBody> Body<B, T> {
 
 impl<B: Payload, T: TapBody> Drop for Body<B, T> {
     fn drop(&mut self) {
-        trace!("dropping tap body");
         // TODO this should be recorded as a cancelation if the stream didn't end.
         self.eos(None);
     }
