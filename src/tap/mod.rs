@@ -68,7 +68,7 @@ mod iface {
     }
 
     pub trait Subscribe<T: Tap> {
-        fn subscribe(&mut self, tap: Weak<T>);
+        fn subscribe(&mut self, tap: T);
     }
 
     pub trait Tap {

@@ -2,7 +2,7 @@ use futures::{Async, Future, Poll, Stream};
 use futures::sync::mpsc;
 use never::Never;
 use std::collections::VecDeque;
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 
 use super::iface::Tap;
 
@@ -36,15 +36,15 @@ pub struct Daemon<T> {
     svc_rx: mpsc::Receiver<mpsc::Sender<Weak<T>>>,
     svcs: VecDeque<mpsc::Sender<Weak<T>>>,
 
-    tap_rx: mpsc::Receiver<Weak<T>>,
-    taps: VecDeque<Weak<T>>,
+    tap_rx: mpsc::Receiver<T>,
+    taps: VecDeque<Arc<T>>,
 }
 
 #[derive(Debug)]
 pub struct Register<T>(mpsc::Sender<mpsc::Sender<Weak<T>>>);
 
 #[derive(Debug)]
-pub struct Subscribe<T>(mpsc::Sender<Weak<T>>);
+pub struct Subscribe<T>(mpsc::Sender<T>);
 
 impl<T: Tap> Future for Daemon<T> {
     type Item = ();
@@ -53,7 +53,7 @@ impl<T: Tap> Future for Daemon<T> {
     fn poll(&mut self) -> Poll<(), Never> {
         // Drop taps that are no longer active (i.e. the response stream has
         // been droped).
-        self.taps.retain(|t| t.upgrade().map(|t| t.can_tap_more()).unwrap_or(false));
+        self.taps.retain(|t| t.can_tap_more());
 
         // Connect newly-created services to active taps.
         while let Ok(Async::Ready(Some(mut svc))) = self.svc_rx.poll() {
@@ -62,7 +62,7 @@ impl<T: Tap> Future for Daemon<T> {
             let mut is_ok = true;
             for tap in &self.taps {
                 if is_ok {
-                    is_ok = svc.try_send(tap.clone()).is_ok();
+                    is_ok = svc.try_send(Arc::downgrade(tap)).is_ok();
                 }
             }
 
@@ -72,16 +72,17 @@ impl<T: Tap> Future for Daemon<T> {
         }
 
         // Connect newly-created taps to existing services.
-        while let Ok(Async::Ready(Some(tap))) = self.tap_rx.poll() {
-            if tap.upgrade().is_none() {
+        while let Ok(Async::Ready(Some(t))) = self.tap_rx.poll() {
+            if !t.can_tap_more() {
                 continue;
             }
+            let tap = Arc::new(t);
 
             // Notify services of the new tap. If the tap can't be sent to a
             // given service, it's assumed that the service has been dropped, so
             // it is removed from the registry.
             for idx in (0..self.svcs.len()).rev() {
-                if self.svcs[idx].try_send(tap.clone()).is_err() {
+                if self.svcs[idx].try_send(Arc::downgrade(&tap)).is_err() {
                     self.svcs.swap_remove_back(idx);
                 }
             }
@@ -117,7 +118,7 @@ impl<T: Tap> Clone for Subscribe<T> {
 }
 
 impl<T: Tap> super::iface::Subscribe<T> for Subscribe<T> {
-    fn subscribe(&mut self, tap: Weak<T>) {
+    fn subscribe(&mut self, tap: T) {
         let _ = self.0.try_send(tap);
     }
 }

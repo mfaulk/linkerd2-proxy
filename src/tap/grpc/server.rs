@@ -2,7 +2,7 @@ use bytes::Buf;
 use futures::{future, sync::mpsc, Poll, Stream};
 use http::HeaderMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 use tokio_timer::clock;
 use tower_grpc::{self as grpc, Response};
@@ -26,7 +26,7 @@ pub struct Server<T> {
 #[derive(Debug)]
 pub struct ResponseStream {
     rx: mpsc::Receiver<api::TapEvent>,
-    tap: Arc<Tap>,
+    _handle: Arc<()>,
 }
 
 #[derive(Debug)]
@@ -36,6 +36,7 @@ pub struct Tap {
     base_id: u32,
     count: AtomicUsize,
     limit: usize,
+    response_handle: Weak<()>,
 }
 
 #[derive(Debug)]
@@ -116,9 +117,10 @@ where
         info!("tap: id={}; match={:?}", base_id, match_);
 
         let (tx, rx) = mpsc::channel(PER_REQUEST_BUFFER_CAPACITY);
-        let tap = Arc::new(Tap::new(base_id, tx, match_, limit));
-        self.subscribe.subscribe(Arc::downgrade(&tap));
-        future::ok(Response::new(ResponseStream { rx, tap }))
+        let _handle = Arc::new(());
+        let tap = Tap::new(base_id, tx, match_, limit, Arc::downgrade(&_handle));
+        self.subscribe.subscribe(tap);
+        future::ok(Response::new(ResponseStream { rx, _handle }))
     }
 }
 
@@ -132,13 +134,20 @@ impl Stream for ResponseStream {
 }
 
 impl Tap {
-    fn new(base_id: u32, tx: mpsc::Sender<api::TapEvent>, match_: Match, limit: usize) -> Self {
+    fn new(
+        base_id: u32,
+        tx: mpsc::Sender<api::TapEvent>,
+        match_: Match,
+        limit: usize,
+        response_handle: Weak<()>,
+    ) -> Self {
         Self {
             tx,
             match_,
             base_id,
             limit,
             count: 0.into(),
+            response_handle,
         }
     }
 
@@ -175,7 +184,7 @@ impl iface::Tap for Tap {
     type TapResponseBody = TapResponseBody;
 
     fn can_tap_more(&self) -> bool {
-        self.count.load(Ordering::Acquire) < self.limit
+        self.response_handle.upgrade().is_some() && self.count.load(Ordering::Acquire) < self.limit
     }
 
     fn tap<B: Payload, I: Inspect>(
