@@ -2,7 +2,7 @@ use bytes::Buf;
 use futures::{future, sync::mpsc, Poll, Stream};
 use http::HeaderMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 use tokio_timer::clock;
 use tower_grpc::{self as grpc, Response};
@@ -31,7 +31,7 @@ pub struct ResponseStream {
 
 #[derive(Debug)]
 pub struct Tap {
-    tx: mpsc::Sender<api::TapEvent>,
+    tx: Mutex<Option<mpsc::Sender<api::TapEvent>>>,
     match_: Match,
     base_id: u32,
     count: AtomicUsize,
@@ -141,7 +141,7 @@ impl Tap {
         response_handle: Weak<()>,
     ) -> Self {
         Self {
-            tx,
+            tx: Mutex::new(Some(tx)),
             match_,
             base_id,
             limit,
@@ -204,6 +204,17 @@ impl iface::Tap for Tap {
             return None;
         }
 
+        let mut tx = {
+            let mut tx = self.tx.lock().ok()?;
+
+            // If this is the last tap, take the sender instead of cloning it.
+            if n == self.limit - 1 {
+                (*tx).take()?
+            } else {
+                (*tx).clone()?
+            }
+        };
+
         let id = api::tap_event::http::StreamId {
             base: self.base_id,
             stream: n as u64,
@@ -229,7 +240,6 @@ impl iface::Tap for Tap {
             ..base_event.clone()
         };
 
-        let mut tx = self.tx.clone();
         match tx.try_send(event) {
             Ok(()) => trace!("sent tap event; id={}:{}", id.base, id.stream),
             Err(_) => {
