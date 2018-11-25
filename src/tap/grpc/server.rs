@@ -193,6 +193,8 @@ impl iface::Tap for Tap {
     ) -> Option<(TapRequestBody, TapResponse)> {
         let request_init_at = clock::now();
 
+        self.response_handle.upgrade()?;
+
         if !self.match_.matches(req, inspect) {
             trace!("request does not match; tap={}", self.base_id);
             return None;
@@ -200,20 +202,16 @@ impl iface::Tap for Tap {
 
         let n = self.count.fetch_add(1, Ordering::AcqRel);
         if n >= self.limit {
-            debug!("tap exhausted; tap={}", self.base_id);
             return None;
         }
 
-        let mut tx = {
-            let mut tx = self.tx.lock().ok()?;
-
-            // If this is the last tap, take the sender instead of cloning it.
+        let mut tx = self.tx.lock().ok().and_then(|mut tx| {
             if n == self.limit - 1 {
-                (*tx).take()?
+                (*tx).take()
             } else {
-                (*tx).clone()?
+                (*tx).clone()
             }
-        };
+        })?;
 
         let id = api::tap_event::http::StreamId {
             base: self.base_id,
@@ -285,7 +283,10 @@ impl iface::TapResponse for TapResponse {
         };
         match self.tx.try_send(event) {
             Ok(()) => trace!("sent tap event; id={}:{}", self.id.base, self.id.stream),
-            Err(_) => debug!("failed to emit tap event; id={}:{}", self.id.base, self.id.stream),
+            Err(_) => debug!(
+                "failed to emit tap event; id={}:{}",
+                self.id.base, self.id.stream
+            ),
         }
 
         TapResponseBody {
@@ -323,7 +324,10 @@ impl iface::TapResponse for TapResponse {
 
         match self.tx.try_send(event) {
             Ok(()) => trace!("sent tap event; id={}:{}", self.id.base, self.id.stream),
-            Err(_) => debug!("failed to emit tap event; id={}:{}", self.id.base, self.id.stream),
+            Err(_) => debug!(
+                "failed to emit tap event; id={}:{}",
+                self.id.base, self.id.stream
+            ),
         }
     }
 }
@@ -353,7 +357,12 @@ impl iface::TapBody for TapResponseBody {
     }
 
     fn fail(self, e: &h2::Error) {
-        trace!("failing response stream; id={}:{}; error={}", self.id.base, self.id.stream, e);
+        trace!(
+            "failing response stream; id={}:{}; error={}",
+            self.id.base,
+            self.id.stream,
+            e
+        );
         let end = e.reason().map(|r| api::eos::End::ResetErrorCode(r.into()));
         self.send(end);
     }
@@ -383,7 +392,10 @@ impl TapResponseBody {
 
         match self.tx.try_send(event) {
             Ok(()) => trace!("sent tap event; id={}:{}", self.id.base, self.id.stream),
-            Err(_) => debug!("failed to emit tap event; id={}:{}", self.id.base, self.id.stream),
+            Err(_) => debug!(
+                "failed to emit tap event; id={}:{}",
+                self.id.base, self.id.stream
+            ),
         }
     }
 }
