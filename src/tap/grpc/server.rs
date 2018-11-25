@@ -14,8 +14,8 @@ use super::match_::Match;
 use proxy::http::HasH2Reason;
 use tap::{iface, Inspect};
 
-// Buffer ~10 req/rsp pairs' worth of events.
-const PER_REQUEST_BUFFER_CAPACITY: usize = 40;
+// Buffer ~100 req/rsp pairs' worth of events per tap request.
+const PER_REQUEST_BUFFER_CAPACITY: usize = 400;
 
 #[derive(Clone, Debug)]
 pub struct Server<T> {
@@ -193,7 +193,7 @@ impl iface::Tap for Tap {
     ) -> Option<(TapRequestBody, TapResponse)> {
         let request_init_at = clock::now();
 
-        if !self.match_.matches(&req, inspect) {
+        if !self.match_.matches(req, inspect) {
             trace!("request does not match; tap={}", self.base_id);
             return None;
         }
