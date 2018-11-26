@@ -80,7 +80,7 @@ where
     fn make(&self, target: &T) -> Result<Self::Value, Self::Error> {
         let inner = self.inner.make(&target).map_err(Error::Stack)?;
         let executor = logging::context_executor(target.clone());
-        Buffer::new(inner, &executor).map_err(Error::Spawn)
+        Buffer::with_executor(inner, &executor).map_err(Error::Spawn)
     }
 }
 

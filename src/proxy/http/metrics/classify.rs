@@ -56,6 +56,10 @@ pub trait ClassifyEos {
     /// Because errors indicate an end-of-stream, a classification must be
     /// returned.
     fn error(self, error: &Self::Error) -> Self::Class;
+
+    /// Check if the classification is already known before the
+    /// body needs to be streamed.
+    fn no_body(&self) -> Option<Self::Class>;
 }
 
 // Used for stack targets that can produce a `Classify` implementation.

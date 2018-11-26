@@ -5,8 +5,10 @@ use http;
 use indexmap::IndexMap;
 use regex::Regex;
 use std::iter::FromIterator;
+use std::time::Duration;
 use std::sync::Arc;
 use std::{error, fmt};
+use tower_retry::budget::Budget;
 
 use NameAddr;
 
@@ -42,6 +44,7 @@ pub enum Error {}
 pub struct Route {
     labels: Arc<IndexMap<String, String>>,
     response_classes: ResponseClasses,
+    retries: Option<Retries>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +75,12 @@ pub enum ResponseMatch {
     },
 }
 
+#[derive(Clone, Debug)]
+pub struct Retries {
+    budget: Arc<Budget>,
+    timeout: Duration,
+}
+
 // === impl Route ===
 
 impl Route {
@@ -88,6 +97,7 @@ impl Route {
         Self {
             labels,
             response_classes: response_classes.into(),
+            retries: None,
         }
     }
 
@@ -97,6 +107,17 @@ impl Route {
 
     pub fn response_classes(&self) -> &ResponseClasses {
         &self.response_classes
+    }
+
+    pub fn retries(&self) -> Option<&Retries> {
+        self.retries.as_ref()
+    }
+
+    pub fn set_retries(&mut self, budget: Arc<Budget>, timeout: Duration) {
+        self.retries = Some(Retries {
+            budget,
+            timeout,
+        });
     }
 }
 
@@ -142,6 +163,18 @@ impl ResponseMatch {
             ResponseMatch::All(ref ms) => ms.iter().all(|m| m.is_match(req)),
             ResponseMatch::Any(ref ms) => ms.iter().any(|m| m.is_match(req)),
         }
+    }
+}
+
+// === impl Retries ===
+
+impl Retries {
+    pub fn budget(&self) -> &Arc<Budget> {
+        &self.budget
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 }
 

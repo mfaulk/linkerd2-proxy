@@ -171,6 +171,18 @@ impl classify::ClassifyEos for Eos {
     fn error(self, err: &h2::Error) -> Self::Class {
         Class::Stream(SuccessOrFailure::Failure, format!("{}", err))
     }
+
+    fn no_body(&self) -> Option<Self::Class> {
+        match self {
+            Eos::Default(status) if status.is_server_error() => {
+                Some(Class::Default(SuccessOrFailure::Failure))
+            }
+            Eos::Default(_) => Some(Class::Default(SuccessOrFailure::Success)),
+            Eos::Grpc(GrpcEos::NoBody(class)) => Some(class.clone()),
+            Eos::Grpc(GrpcEos::Open) => None,
+            Eos::Profile(class) => Some(class.clone()),
+        }
+    }
 }
 
 fn grpc_class(headers: &http::HeaderMap) -> Option<Class> {
@@ -186,6 +198,19 @@ fn grpc_class(headers: &http::HeaderMap) -> Option<Class> {
             };
             Class::Grpc(ok, grpc_status)
         })
+}
+
+// === impl Class ===
+
+impl Class {
+    pub(super) fn is_failure(&self) -> bool {
+        match self {
+            Class::Default(SuccessOrFailure::Failure) |
+            Class::Grpc(SuccessOrFailure::Failure, _) |
+            Class::Stream(SuccessOrFailure::Failure, _) => true,
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
