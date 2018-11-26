@@ -22,7 +22,6 @@ pub fn new() -> (Layer, Server, Daemon) {
     (layer, server, daemon)
 }
 
-///
 pub trait Inspect {
     fn src_addr<B>(&self, req: &http::Request<B>) -> Option<net::SocketAddr>;
     fn src_tls<B>(&self, req: &http::Request<B>) -> tls::Status;
@@ -38,12 +37,15 @@ pub trait Inspect {
     }
 
     fn authority<B>(&self, req: &http::Request<B>) -> Option<String> {
-        req.uri().authority_part().map(|a| a.as_str().to_owned()).or_else(|| {
-            req.headers()
-                .get(http::header::HOST)
-                .and_then(|h| h.to_str().ok())
-                .map(|s| s.to_owned())
-        })
+        req.uri()
+            .authority_part()
+            .map(|a| a.as_str().to_owned())
+            .or_else(|| {
+                req.headers()
+                    .get(http::header::HOST)
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.to_owned())
+            })
     }
 }
 
@@ -53,8 +55,9 @@ pub trait Inspect {
 /// forLayer/Server/Daemon to
 mod iface {
     use bytes::Buf;
-    use futures::Stream;
+    use futures::{Future, Stream};
     use http;
+    use never::Never;
     use std::sync::Weak;
     use tower_h2::Body as Payload;
 
@@ -71,20 +74,38 @@ mod iface {
         fn subscribe(&mut self, tap: T);
     }
 
-    pub trait Tap {
+    pub trait Tap: Clone {
+        type TapRequest: TapRequest<
+            TapBody = Self::TapRequestBody,
+            TapResponse = Self::TapResponse,
+            TapResponseBody = Self::TapResponseBody,
+        >;
         type TapRequestBody: TapBody;
         type TapResponse: TapResponse<TapBody = Self::TapResponseBody>;
         type TapResponseBody: TapBody;
+        type Future: Future<Item = Option<Self::TapRequest>, Error = Never>;
 
-        fn can_tap_more(&self) -> bool {
-            true
-        }
+        fn can_tap_more(&self) -> bool;
 
-        fn tap<B: Payload, I: super::Inspect>(
+        fn matches<B: Payload, I: super::Inspect>(
             &self,
             req: &http::Request<B>,
             inspect: &I,
-        ) -> Option<(Self::TapRequestBody, Self::TapResponse)>;
+        ) -> bool;
+
+        fn tap(&mut self) -> Self::Future;
+    }
+
+    pub trait TapRequest {
+        type TapBody: TapBody;
+        type TapResponse: TapResponse<TapBody = Self::TapResponseBody>;
+        type TapResponseBody: TapBody;
+
+        fn open<B: Payload, I: super::Inspect>(
+            &mut self,
+            req: &http::Request<B>,
+            inspect: &I,
+        ) -> Option<(Self::TapBody, Self::TapResponse)>;
     }
 
     pub trait TapBody {

@@ -28,11 +28,11 @@ pub fn new<T>() -> (Daemon<T>, Register<T>, Subscribe<T>) {
 #[must_use = "daemon must be polled"]
 #[derive(Debug)]
 pub struct Daemon<T> {
-    svc_rx: mpsc::Receiver<mpsc::Sender<Weak<T>>>,
-    svcs: VecDeque<mpsc::Sender<Weak<T>>>,
+    svc_rx: mpsc::Receiver<mpsc::Sender<T>>,
+    svcs: VecDeque<mpsc::Sender<T>>,
 
     tap_rx: mpsc::Receiver<T>,
-    taps: VecDeque<Arc<T>>,
+    taps: VecDeque<T>,
 }
 
 #[derive(Debug)]

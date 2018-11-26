@@ -1,5 +1,5 @@
 use bytes::IntoBuf;
-use futures::{Async, Future, Poll, Stream};
+use futures::{future, Async, Future, Poll, Stream};
 use h2;
 use http;
 use std::collections::VecDeque;
@@ -34,9 +34,13 @@ pub struct Service<I, R, S, T> {
 }
 
 #[derive(Debug, Clone)]
-pub struct ResponseFuture<F, T: TapResponse> {
-    inner: F,
-    taps: VecDeque<T>,
+pub enum ResponseFuture<F: Future, S: Service> {
+    PendingTaps {
+        taps: future::JoinAll<VecDeque<F>>,
+        req: S::Request,
+        service: S,
+    },
+    PendingCall(S::Future),
 }
 
 #[derive(Debug)]
@@ -104,7 +108,7 @@ where
     I: Inspect,
     R: Stream<Item = Weak<S>>,
     S: Tap,
-    T: svc::Service<http::Request<Body<A, S::TapRequestBody>>, Response = http::Response<B>>,
+    T: svc::Service<http::Request<Body<A, S::TapRequestBody>>, Response = http::Response<B>> + Clone,
     T::Error: HasH2Reason,
     A: Payload,
     B: Payload,
@@ -116,35 +120,40 @@ where
     fn poll_ready(&mut self) -> Poll<(), Self::Error> {
         while let Ok(Async::Ready(Some(s))) = self.tap_rx.poll() {
             self.taps.push_back(s);
+            trace!("tap installed");
         }
+
+        let n = self.taps.len();
         self.taps
             .retain(|t| t.upgrade().map(|t| t.can_tap_more()).unwrap_or(false));
+        trace!("");
+
         self.inner.poll_ready()
     }
 
     fn call(&mut self, req: http::Request<A>) -> Self::Future {
-        let mut req_taps = VecDeque::with_capacity(self.taps.len());
-        let mut rsp_taps = VecDeque::with_capacity(self.taps.len());
+        let mut taps = VecDeque::with_capacity(self.taps.len());
         for t in self.taps.iter().filter_map(Weak::upgrade) {
-            if let Some((req_tap, rsp_tap)) = t.tap(&req, &self.inspect) {
-                req_taps.push_back(req_tap);
-                rsp_taps.push_back(rsp_tap);
+            if t.matches(&req, &self.inspect) {
+                taps.push_back(t.tap());
             }
         }
 
-        let req = {
-            let (head, inner) = req.into_parts();
-            let body = Body {
-                inner,
-                taps: req_taps,
-            };
-            http::Request::from_parts(head, body)
-        };
+        let taps = future::join_all(taps);
 
-        let inner = self.inner.call(req);
-        ResponseFuture {
-            inner,
-            taps: rsp_taps,
+        // let req = {
+        //     let (head, inner) = req.into_parts();
+        //     let body = Body {
+        //         inner,
+        //         taps: req_taps,
+        //     };
+        //     http::Request::from_parts(head, body)
+        // };
+
+        ResponseFuture::PendingTaps {
+            req,
+            taps,
+            service: self.inner.clone(),
         }
     }
 }

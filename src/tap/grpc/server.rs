@@ -1,8 +1,10 @@
 use bytes::Buf;
-use futures::{future, sync::mpsc, Poll, Stream};
+use futures::sync::{mpsc, oneshot};
+use futures::{future, Async, Future, Poll, Stream};
 use http::HeaderMap;
+use never::Never;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 use tokio_timer::clock;
 use tower_grpc::{self as grpc, Response};
@@ -15,6 +17,9 @@ use proxy::http::HasH2Reason;
 use tap::{iface, Inspect};
 
 // Buffer ~100 req/rsp pairs' worth of events per tap request.
+const TAP_BUFFER_CAPACITY: usize = 100;
+
+// Buffer ~100 req/rsp pairs' worth of events per tap request.
 const PER_REQUEST_BUFFER_CAPACITY: usize = 400;
 
 #[derive(Clone, Debug)]
@@ -25,43 +30,70 @@ pub struct Server<T> {
 
 #[derive(Debug)]
 pub struct ResponseStream {
-    rx: mpsc::Receiver<api::TapEvent>,
-    _handle: Arc<()>,
+    dispatch: Option<Dispatch>,
+    events_rx: mpsc::Receiver<api::TapEvent>,
 }
 
 #[derive(Debug)]
-pub struct Tap {
-    tx: Mutex<Option<mpsc::Sender<api::TapEvent>>>,
-    match_: Match,
+struct Dispatch {
     base_id: u32,
-    count: AtomicUsize,
+    count: usize,
     limit: usize,
-    response_handle: Weak<()>,
+    taps_rx: mpsc::Receiver<oneshot::Sender<TapTx>>,
+    events_tx: mpsc::Sender<api::TapEvent>,
+    _match: Arc<Match>,
+}
+
+#[derive(Clone, Debug)]
+struct TapTx {
+    id: api::tap_event::http::StreamId,
+    tx: mpsc::Sender<api::TapEvent>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Tap {
+    match_: Weak<Match>,
+    taps_tx: mpsc::Sender<oneshot::Sender<TapTx>>,
+}
+
+#[derive(Debug)]
+pub enum TapFuture {
+    Init {
+        request_init_at: Instant,
+        taps_tx: mpsc::Sender<oneshot::Sender<TapTx>>
+    },
+    Pending {
+        request_init_at: Instant,
+        rx: oneshot::Receiver<TapTx>,
+    },
+}
+
+#[derive(Debug)]
+pub struct TapRequest {
+    request_init_at: Instant,
+    tap: TapTx,
 }
 
 #[derive(Debug)]
 pub struct TapResponse {
     base_event: api::TapEvent,
-    id: api::tap_event::http::StreamId,
     request_init_at: Instant,
-    tx: mpsc::Sender<api::TapEvent>,
+    tap: TapTx,
 }
 
 #[derive(Debug)]
 pub struct TapRequestBody {
     base_event: api::TapEvent,
-    id: api::tap_event::http::StreamId,
-    tx: mpsc::Sender<api::TapEvent>,
+    tap: TapTx,
 }
 
 #[derive(Debug)]
 pub struct TapResponseBody {
     base_event: api::TapEvent,
-    id: api::tap_event::http::StreamId,
     request_init_at: Instant,
     response_init_at: Instant,
     response_bytes: usize,
-    tx: mpsc::Sender<api::TapEvent>,
+    tap: TapTx,
 }
 
 impl<T: iface::Subscribe<Tap>> Server<T> {
@@ -95,8 +127,13 @@ where
         };
         trace!("tap: limit={}", limit);
 
+        // Read the match logic into a type we can use to evaluate against
+        // requests. This match will be shared (weakly) by all registered
+        // services to match requests. The response stream strongly holds the
+        // match until the response is complete. This way, services never
+        // evaluate matches for taps that have been completed or canceled.
         let match_ = match Match::try_new(req.match_) {
-            Ok(m) => m,
+            Ok(m) => Arc::new(m),
             Err(e) => {
                 warn!("invalid tap request: {} ", e);
                 let v = format!("{}", e)
@@ -111,11 +148,48 @@ where
         let base_id = self.base_id.fetch_add(1, Ordering::AcqRel) as u32;
         debug!("tap; id={}; match={:?}", base_id, match_);
 
-        let (tx, rx) = mpsc::channel(PER_REQUEST_BUFFER_CAPACITY);
-        let _handle = Arc::new(());
-        let tap = Tap::new(base_id, tx, match_, limit, Arc::downgrade(&_handle));
+        // The taps channel is used by services to acquire a `TapTx` for
+        // `Dispatch`, i.e. ensuring that no more than the requested number of
+        // taps are executed.
+        //
+        // The read side of this channel (held by `dispatch`) is dropped by the
+        // `ResponseStream` once the `limit` has been reached. This is dropped
+        // with the strong reference to `match_` so that services can determine
+        // when a Tap should be dropped.
+        //
+        // The response stream continues to process events for open streams
+        // until all streams have been completed.
+        let (taps_tx, taps_rx) = mpsc::channel(TAP_BUFFER_CAPACITY);
+
+        // This tap is cloned onto each
+        let tap = Tap::new(Arc::downgrade(match_), taps_tx);
         self.subscribe.subscribe(tap);
-        future::ok(Response::new(ResponseStream { rx, _handle }))
+
+        // The events channel is used to emit tap events to the response stream.
+        //
+        // At most `limit` copies of `events_tx` are dispatched to `taps_rx`
+        // requests. Each tapped request's sender is dropped when the response
+        // completes, so the event stream closes gracefully when all tapped
+        // requests are completed without additional coordination.
+        let (events_tx, events_rx) = mpsc::channel(PER_REQUEST_BUFFER_CAPACITY);
+
+        // Reads up to `limit` requests from from `taps_rx` and satisfies them
+        // with a cpoy of `events_tx`.
+        let dispatch = Dispatch {
+            base_id,
+            count: 0,
+            limit,
+            taps_rx,
+            events_tx,
+            _match: match_,
+        };
+
+        let rsp = ResponseStream {
+            dispatch: Some(dispatch),
+            events_rx,
+        };
+
+        future::ok(Response::new(rsp))
     }
 }
 
@@ -124,30 +198,51 @@ impl Stream for ResponseStream {
     type Error = grpc::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        // Drop the dispatch future once it completes so that services do not do
+        // any more matching against this tap.
+        self.dispatch = self.dispatch.take().and_then(|d| match d.poll() {
+            Ok(Async::NotReady) => Some(d),
+            Ok(Async::Ready(())) | Err(_) => None,
+        });
+
         let poll: Poll<Option<Self::Item>, Self::Error> =
-            self.rx.poll().or_else(|_| Ok(None.into()));
+            self.events_rx.poll().or_else(|_| Ok(None.into()));
         let event = try_ready!(poll);
         trace!("ResponseStream::poll: event={:?}", event);
         Ok(event.into())
     }
 }
 
-impl Tap {
-    fn new(
-        base_id: u32,
-        tx: mpsc::Sender<api::TapEvent>,
-        match_: Match,
-        limit: usize,
-        response_handle: Weak<()>,
-    ) -> Self {
-        Self {
-            tx: Mutex::new(Some(tx)),
-            match_,
-            base_id,
-            limit,
-            count: 0.into(),
-            response_handle,
+impl Future for Dispatch {
+    type Item = ();
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<(), Self::Error> {
+        while let Some(tx) = try_ready!(self.taps_rx.poll().map_err(|_| ())) {
+            debug_assert!(self.count < self.limit - 1);
+
+            self.count += 1;
+            let tap = TapTx {
+                id: api::tap_event::http::StreamId {
+                    base: self.base_id,
+                    stream: self.count as u64,
+                },
+                tx: self.events_tx.clone(),
+            };
+            let _ = tx.send(tap);
+
+            if self.count == self.limit - 1 {
+                return Ok(Async::Ready(()));
+            }
         }
+
+        Ok(Async::Ready(()))
+    }
+}
+
+impl Tap {
+    fn new(match_: Weak<Match>, taps_tx: mpsc::Sender<oneshot::Sender<TapTx>>) -> Self {
+        Self { match_, taps_tx }
     }
 
     fn base_event<B, I: Inspect>(req: &http::Request<B>, inspect: &I) -> api::TapEvent {
@@ -181,83 +276,82 @@ impl iface::Tap for Tap {
     type TapRequestBody = TapRequestBody;
     type TapResponse = TapResponse;
     type TapResponseBody = TapResponseBody;
+    type Future = TapFuture;
 
     fn can_tap_more(&self) -> bool {
-        self.response_handle.upgrade().is_some() && self.count.load(Ordering::Acquire) < self.limit
+        self.match_.upgrade().is_some()
     }
 
-    fn tap<B: Payload, I: Inspect>(
+    fn matches<B: Payload, I: Inspect>(
         &self,
         req: &http::Request<B>,
         inspect: &I,
-    ) -> Option<(TapRequestBody, TapResponse)> {
-        let request_init_at = clock::now();
+    ) -> bool {
+        self.match_.upgrade().map(|m| m.matches(req, inspect)).unwrap_or(false)
+    }
 
-        self.response_handle.upgrade()?;
-
-        if !self.match_.matches(req, inspect) {
-            trace!("request does not match; tap={}", self.base_id);
-            return None;
+    fn tap(&mut self) -> Self::Future {
+        TapFuture::init {
+            request_init_at: clock::now(),
+            taps_tx: self.taps_tx.clone(),
         }
+    }
+}
 
-        let n = self.count.fetch_add(1, Ordering::AcqRel);
-        if n >= self.limit {
-            return None;
-        }
+impl Future for TapFuture {
+    type Item = Option<TapRequest>;
+    type Error = Never;
 
-        let mut tx = self.tx.lock().ok().and_then(|mut tx| {
-            if n == self.limit - 1 {
-                (*tx).take()
-            } else {
-                (*tx).clone()
-            }
-        })?;
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        loop {
+            *self = match self {
+                TapFuture::Init { request_init_at, taps_tx } => {
+                    try_ready!(taps_tx.poll_ready())
+                    let (tx, rx) = oneshot::channel();
+                    taps_tx.try_send(tx).expect()
+                    TapFuture::Pending {
+                        request_init_at: *request_init_at,
+                        rx,
+                    }
+                }
+                TapFuture::Pending { request_init_at, rx } => {
+                    let tap = try_ready!(rx.poll());
 
-        let id = api::tap_event::http::StreamId {
-            base: self.base_id,
-            stream: n as u64,
-        };
-        trace!("request matches tap; id={}:{}", id.base, id.stream);
-
-        // All of the events emitted from tap have a common set of metadata.
-        // Build this once, without an `event`, so that it can be used to build
-        // each HTTP event.
-        let base_event = Self::base_event(req, inspect);
-        let event = api::TapEvent {
-            event: Some(api::tap_event::Event::Http(api::tap_event::Http {
-                event: Some(api::tap_event::http::Event::RequestInit(
-                    api::tap_event::http::RequestInit {
-                        id: Some(id.clone()),
+                    let init = api::tap_event::http::RequestInit {
+                        id: Some(tap.id.clone()),
                         method: Some(req.method().into()),
                         scheme: req.uri().scheme_part().map(http_types::Scheme::from),
                         authority: inspect.authority(req).unwrap_or_default().to_owned(),
                         path: req.uri().path().into(),
-                    },
-                )),
-            })),
-            ..base_event.clone()
-        };
+                    };
 
-        match tx.try_send(event) {
-            Ok(()) => trace!("sent tap event; id={}:{}", id.base, id.stream),
-            Err(_) => {
-                debug!("failed to emit tap event; id={}:{}", id.base, id.stream);
-                return None;
+                    // All of the events emitted from tap have a common set of metadata.
+                    // Build this once, without an `event`, so that it can be used to build
+                    // each HTTP event.
+                    let base_event = Tap::base_event(req, inspect);
+                    let event = api::TapEvent {
+                        event: Some(api::tap_event::Event::Http(api::tap_event::Http {
+                            event: Some(api::tap_event::http::Event::RequestInit(init)),
+                        })),
+                        ..base_event.clone()
+                    };
+                    if let Err(_) = tap.tx.try_send(event) {
+                        return Ok(None.into());
+                    }
+
+                    let req = TapRequestBody {
+                        tap: tap.clone(),
+                        base_event: base_event.clone(),
+                    };
+                    let rsp = TapResponse {
+                        tap,
+                        base_event,
+                        request_init_at,
+                    };
+                    return Ok(Some((req, rsp)).into());
+                }
             }
         }
-
-        let req = TapRequestBody {
-            id: id.clone(),
-            tx: tx.clone(),
-            base_event: base_event.clone(),
-        };
-        let rsp = TapResponse {
-            id,
-            tx,
-            base_event,
-            request_init_at,
-        };
-        Some((req, rsp))
     }
 }
 
@@ -265,70 +359,60 @@ impl iface::TapResponse for TapResponse {
     type TapBody = TapResponseBody;
 
     fn tap<B: Payload>(mut self, rsp: &http::Response<B>) -> TapResponseBody {
-        trace!("tapping response; id={}:{}", self.id.base, self.id.stream);
+        trace!(
+            "tapping response; id={}:{}",
+            self.tap.id.base,
+            self.tap.id.stream
+        );
         let response_init_at = clock::now();
+        let init = api::tap_event::http::Event::ResponseInit(api::tap_event::http::ResponseInit {
+            id: Some(self.tap.id.clone()),
+            since_request_init: Some(pb_duration(response_init_at - self.request_init_at)),
+            http_status: rsp.status().as_u16().into(),
+        });
+
         let event = api::TapEvent {
             event: Some(api::tap_event::Event::Http(api::tap_event::Http {
-                event: Some(api::tap_event::http::Event::ResponseInit(
-                    api::tap_event::http::ResponseInit {
-                        id: Some(self.id.clone()),
-                        since_request_init: Some(pb_duration(
-                            response_init_at - self.request_init_at,
-                        )),
-                        http_status: rsp.status().as_u16().into(),
-                    },
-                )),
+                event: Some(init),
             })),
             ..self.base_event.clone()
         };
-        match self.tx.try_send(event) {
-            Ok(()) => trace!("sent tap event; id={}:{}", self.id.base, self.id.stream),
-            Err(_) => debug!(
-                "failed to emit tap event; id={}:{}",
-                self.id.base, self.id.stream
-            ),
-        }
+        let _ = tx.try_send(event).ok();
 
         TapResponseBody {
             base_event: self.base_event,
-            id: self.id,
             request_init_at: self.request_init_at,
             response_init_at,
             response_bytes: 0,
-            tx: self.tx,
+            tap: self.tap,
         }
     }
 
-    fn fail<E: HasH2Reason>(mut self, e: &E) {
-        trace!("failing response; id={}:{}", self.id.base, self.id.stream);
+    fn fail<E: HasH2Reason>(mut self, err: &E) {
+        trace!(
+            "failing response; id={}:{}",
+            self.tap.id.base,
+            self.tap.id.stream
+        );
         let response_end_at = clock::now();
-        let end = e
-            .h2_reason()
-            .map(|r| api::eos::End::ResetErrorCode(r.into()));
+        let reason = err.h2_reason();
+        let end = api::tap_event::http::Event::ResponseEnd(api::tap_event::http::ResponseEnd {
+            id: Some(self.tap.id.clone()),
+            since_request_init: Some(pb_duration(response_end_at - self.request_init_at)),
+            since_response_init: None,
+            response_bytes: 0,
+            eos: Some(api::Eos {
+                end: reason.map(|r| api::eos::End::ResetErrorCode(r.into())),
+            }),
+        });
+
         let event = api::TapEvent {
             event: Some(api::tap_event::Event::Http(api::tap_event::Http {
-                event: Some(api::tap_event::http::Event::ResponseEnd(
-                    api::tap_event::http::ResponseEnd {
-                        id: Some(self.id.clone()),
-                        since_request_init: Some(pb_duration(
-                            response_end_at - self.request_init_at,
-                        )),
-                        since_response_init: None,
-                        response_bytes: 0,
-                        eos: Some(api::Eos { end }),
-                    },
-                )),
+                event: Some(end),
             })),
             ..self.base_event
         };
-
-        match self.tx.try_send(event) {
-            Ok(()) => trace!("sent tap event; id={}:{}", self.id.base, self.id.stream),
-            Err(_) => debug!(
-                "failed to emit tap event; id={}:{}",
-                self.id.base, self.id.stream
-            ),
-        }
+        let _ = self.tap.tx.try_send(event);
     }
 }
 
@@ -346,7 +430,11 @@ impl iface::TapBody for TapResponseBody {
     }
 
     fn eos(self, trls: Option<&http::HeaderMap>) {
-        trace!("ending response; id={}:{}", self.id.base, self.id.stream);
+        trace!(
+            "ending response; id={}:{}",
+            self.tap.id.base,
+            self.tap.id.stream
+        );
         let end = trls
             .and_then(|t| t.get("grpc-status"))
             .and_then(|v| v.to_str().ok())
@@ -359,8 +447,8 @@ impl iface::TapBody for TapResponseBody {
     fn fail(self, e: &h2::Error) {
         trace!(
             "failing response stream; id={}:{}; error={}",
-            self.id.base,
-            self.id.stream,
+            self.tap.id.base,
+            self.tap.id.stream,
             e
         );
         let end = e.reason().map(|r| api::eos::End::ResetErrorCode(r.into()));
@@ -371,31 +459,20 @@ impl iface::TapBody for TapResponseBody {
 impl TapResponseBody {
     fn send(mut self, end: Option<api::eos::End>) {
         let response_end_at = clock::now();
+        let end = api::tap_event::http::Event::ResponseEnd(api::tap_event::http::ResponseEnd {
+            id: Some(self.tap.id.clone()),
+            since_request_init: Some(pb_duration(response_end_at - self.request_init_at)),
+            since_response_init: Some(pb_duration(response_end_at - self.response_init_at)),
+            response_bytes: self.response_bytes as u64,
+            eos: Some(api::Eos { end }),
+        });
+
         let event = api::TapEvent {
             event: Some(api::tap_event::Event::Http(api::tap_event::Http {
-                event: Some(api::tap_event::http::Event::ResponseEnd(
-                    api::tap_event::http::ResponseEnd {
-                        id: Some(self.id.clone()),
-                        since_request_init: Some(pb_duration(
-                            response_end_at - self.request_init_at,
-                        )),
-                        since_response_init: Some(pb_duration(
-                            response_end_at - self.response_init_at,
-                        )),
-                        response_bytes: self.response_bytes as u64,
-                        eos: Some(api::Eos { end }),
-                    },
-                )),
+                event: Some(end),
             })),
             ..self.base_event
         };
-
-        match self.tx.try_send(event) {
-            Ok(()) => trace!("sent tap event; id={}:{}", self.id.base, self.id.stream),
-            Err(_) => debug!(
-                "failed to emit tap event; id={}:{}",
-                self.id.base, self.id.stream
-            ),
-        }
+        let _ = self.tap.tx.try_send(event);
     }
 }
