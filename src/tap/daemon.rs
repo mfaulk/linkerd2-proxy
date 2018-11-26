@@ -2,7 +2,6 @@ use futures::{Async, Future, Poll, Stream};
 use futures::sync::mpsc;
 use never::Never;
 use std::collections::VecDeque;
-use std::sync::{Arc, Weak};
 
 use super::iface::Tap;
 
@@ -36,7 +35,7 @@ pub struct Daemon<T> {
 }
 
 #[derive(Debug)]
-pub struct Register<T>(mpsc::Sender<mpsc::Sender<Weak<T>>>);
+pub struct Register<T>(mpsc::Sender<mpsc::Sender<T>>);
 
 #[derive(Debug)]
 pub struct Subscribe<T>(mpsc::Sender<T>);
@@ -61,7 +60,7 @@ impl<T: Tap> Future for Daemon<T> {
             let mut is_ok = true;
             for tap in &self.taps {
                 if is_ok {
-                    is_ok = svc.try_send(Arc::downgrade(tap)).is_ok();
+                    is_ok = svc.try_send(tap.clone()).is_ok();
                 }
             }
 
@@ -72,18 +71,17 @@ impl<T: Tap> Future for Daemon<T> {
         }
 
         // Connect newly-created taps to existing services.
-        while let Ok(Async::Ready(Some(t))) = self.tap_rx.poll() {
+        while let Ok(Async::Ready(Some(tap))) = self.tap_rx.poll() {
             trace!("subscribing a tap");
-            if !t.can_tap_more() {
+            if !tap.can_tap_more() {
                 continue;
             }
-            let tap = Arc::new(t);
 
             // Notify services of the new tap. If the tap can't be sent to a
             // given service, it's assumed that the service has been dropped, so
             // it is removed from the registry.
             for idx in (0..self.svcs.len()).rev() {
-                if self.svcs[idx].try_send(Arc::downgrade(&tap)).is_err() {
+                if self.svcs[idx].try_send(tap.clone()).is_err() {
                     trace!("removing a service");
                     self.svcs.swap_remove_back(idx);
                 }
@@ -105,7 +103,7 @@ impl<T: Tap> Clone for Register<T> {
 
 impl<T: Tap> super::iface::Register for Register<T> {
     type Tap = T;
-    type Taps = mpsc::Receiver<Weak<T>>;
+    type Taps = mpsc::Receiver<T>;
 
     fn register(&mut self) -> Self::Taps {
         let (tx, rx) = mpsc::channel(TAP_CAPACITY);

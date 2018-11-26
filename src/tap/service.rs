@@ -3,10 +3,9 @@ use futures::{future, Async, Future, Poll, Stream};
 use h2;
 use http;
 use std::collections::VecDeque;
-use std::sync::Weak;
 use tower_h2::Body as Payload;
 
-use super::iface::{Register, Tap, TapBody, TapResponse};
+use super::iface::{Register, Tap, TapBody, TapRequest, TapResponse};
 use super::Inspect;
 use proxy::http::HasH2Reason;
 use svc;
@@ -26,21 +25,29 @@ pub struct Stack<R: Register, T> {
 
 /// A middleware that records HTTP taps.
 #[derive(Clone, Debug)]
-pub struct Service<I, R, S, T> {
+pub struct Service<I, R, T, S> {
     tap_rx: R,
-    taps: VecDeque<Weak<S>>,
-    inner: T,
+    taps: VecDeque<T>,
+    inner: S,
     inspect: I,
 }
 
-#[derive(Debug, Clone)]
-pub enum ResponseFuture<F: Future, S: Service> {
-    PendingTaps {
-        taps: future::JoinAll<VecDeque<F>>,
-        req: S::Request,
+pub enum ResponseFuture<
+    I: Inspect,
+    T: Tap,
+    A: Payload,
+    S: svc::Service<http::Request<Body<A, T::TapRequestBody>>>,
+> {
+    Taps {
+        taps: future::JoinAll<VecDeque<T::Future>>,
+        inspect: I,
+        request: Option<http::Request<A>>,
         service: S,
     },
-    PendingCall(S::Future),
+    Call {
+        taps: VecDeque<T::TapResponse>,
+        call: S::Future,
+    },
 }
 
 #[derive(Debug)]
@@ -56,7 +63,7 @@ where
     R: Register + Clone,
 {
     pub(super) fn new(registry: R) -> Self {
-        Layer { registry }
+        Self { registry }
     }
 }
 
@@ -103,101 +110,122 @@ where
 
 // === Service ===
 
-impl<I, R, S, T, A, B> svc::Service<http::Request<A>> for Service<I, R, S, T>
+impl<I, R, S, T, A, B> svc::Service<http::Request<A>> for Service<I, R, T, S>
 where
-    I: Inspect,
-    R: Stream<Item = Weak<S>>,
-    S: Tap,
-    T: svc::Service<http::Request<Body<A, S::TapRequestBody>>, Response = http::Response<B>> + Clone,
-    T::Error: HasH2Reason,
+    I: Inspect + Clone,
+    R: Stream<Item = T>,
+    T: Tap,
+    S: svc::Service<http::Request<Body<A, T::TapRequestBody>>, Response = http::Response<B>>
+        + Clone,
+    S::Error: HasH2Reason,
     A: Payload,
     B: Payload,
 {
-    type Response = http::Response<Body<B, S::TapResponseBody>>;
-    type Error = T::Error;
-    type Future = ResponseFuture<T::Future, S::TapResponse>;
+    type Response = http::Response<Body<B, T::TapResponseBody>>;
+    type Error = S::Error;
+    type Future = ResponseFuture<I, T, A, S>;
 
     fn poll_ready(&mut self) -> Poll<(), Self::Error> {
-        while let Ok(Async::Ready(Some(s))) = self.tap_rx.poll() {
-            self.taps.push_back(s);
-            trace!("tap installed");
+        while let Ok(Async::Ready(Some(t))) = self.tap_rx.poll() {
+            self.taps.push_back(t);
         }
 
-        let n = self.taps.len();
-        self.taps
-            .retain(|t| t.upgrade().map(|t| t.can_tap_more()).unwrap_or(false));
-        trace!("");
-
+        self.taps.retain(|t| t.can_tap_more());
         self.inner.poll_ready()
     }
 
     fn call(&mut self, req: http::Request<A>) -> Self::Future {
         let mut taps = VecDeque::with_capacity(self.taps.len());
-        for t in self.taps.iter().filter_map(Weak::upgrade) {
+        for t in self.taps.iter_mut() {
             if t.matches(&req, &self.inspect) {
                 taps.push_back(t.tap());
             }
         }
 
-        let taps = future::join_all(taps);
-
-        // let req = {
-        //     let (head, inner) = req.into_parts();
-        //     let body = Body {
-        //         inner,
-        //         taps: req_taps,
-        //     };
-        //     http::Request::from_parts(head, body)
-        // };
-
-        ResponseFuture::PendingTaps {
-            req,
-            taps,
+        ResponseFuture::Taps {
+            taps: future::join_all(taps),
+            request: Some(req),
             service: self.inner.clone(),
+            inspect: self.inspect.clone(),
         }
     }
 }
 
-impl<B, F, T> Future for ResponseFuture<F, T>
+impl<A, B, I, T, S> Future for ResponseFuture<I, T, A, S>
 where
+    A: Payload,
     B: Payload,
-    F: Future<Item = http::Response<B>>,
-    F::Error: HasH2Reason,
-    T: TapResponse,
+    I: Inspect,
+    T: Tap,
+    S: svc::Service<http::Request<Body<A, T::TapRequestBody>>, Response = http::Response<B>>,
+    S::Error: HasH2Reason,
 {
-    type Item = http::Response<Body<B, T::TapBody>>;
-    type Error = F::Error;
+    type Item = http::Response<Body<B, T::TapResponseBody>>;
+    type Error = S::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let rsp = try_ready!(self.inner.poll().map_err(|e| self.err(e)));
+        loop {
+            *self = match self {
+                ResponseFuture::Taps {
+                    request,
+                    service,
+                    taps,
+                    inspect,
+                } => {
+                    let taps = match taps.poll() {
+                        Ok(Async::NotReady) => return Ok(Async::NotReady),
+                        Ok(Async::Ready(taps)) => taps,
+                        Err(_) => Vec::new(),
+                    };
 
-        let taps = self.taps.drain(..).map(|t| t.tap(&rsp)).collect();
-        let rsp = {
-            let (head, inner) = rsp.into_parts();
-            let mut body = Body { inner, taps };
-            if body.is_end_stream() {
-                body.eos(None);
-            }
-            http::Response::from_parts(head, body)
-        };
+                    let req = request.take().expect("request must be set");
 
-        Ok(rsp.into())
-    }
-}
+                    let mut req_taps = VecDeque::with_capacity(taps.len());
+                    let mut rsp_taps = VecDeque::with_capacity(taps.len());
+                    for tap in taps.into_iter().filter_map(|t| t) {
+                        let (req, rsp) = tap.open(&req, inspect);
+                        req_taps.push_back(req);
+                        rsp_taps.push_back(rsp);
+                    }
 
-impl<B, F, T> ResponseFuture<F, T>
-where
-    B: Payload,
-    F: Future<Item = http::Response<B>>,
-    F::Error: HasH2Reason,
-    T: TapResponse,
-{
-    fn err(&mut self, error: F::Error) -> F::Error {
-        while let Some(tap) = self.taps.pop_front() {
-            tap.fail(&error);
+                    let req = {
+                        let (head, inner) = req.into_parts();
+                        let body = Body {
+                            inner,
+                            taps: req_taps,
+                        };
+                        http::Request::from_parts(head, body)
+                    };
+
+                    let call = service.call(req);
+
+                    ResponseFuture::Call {
+                        call,
+                        taps: rsp_taps,
+                    }
+                }
+                ResponseFuture::Call { call, taps } => {
+                    return match call.poll() {
+                        Ok(Async::NotReady) => Ok(Async::NotReady),
+                        Ok(Async::Ready(rsp)) => {
+                            let taps = taps.drain(..).map(|t| t.tap(&rsp)).collect();
+                            let (head, inner) = rsp.into_parts();
+                            let mut body = Body { inner, taps };
+                            if body.is_end_stream() {
+                                body.eos(None);
+                            }
+                            Ok(Async::Ready(http::Response::from_parts(head, body)))
+                        }
+                        Err(e) => {
+                            for tap in taps.drain(..) {
+                                tap.fail(&e);
+                            }
+                            Err(e)
+                        }
+                    };
+                }
+            };
         }
-
-        error
     }
 }
 

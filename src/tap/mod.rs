@@ -58,14 +58,13 @@ mod iface {
     use futures::{Future, Stream};
     use http;
     use never::Never;
-    use std::sync::Weak;
     use tower_h2::Body as Payload;
 
     use proxy::http::HasH2Reason;
 
     pub trait Register {
         type Tap: Tap;
-        type Taps: Stream<Item = Weak<Self::Tap>>;
+        type Taps: Stream<Item = Self::Tap>;
 
         fn register(&mut self) -> Self::Taps;
     }
@@ -102,10 +101,10 @@ mod iface {
         type TapResponseBody: TapBody;
 
         fn open<B: Payload, I: super::Inspect>(
-            &mut self,
+            self,
             req: &http::Request<B>,
             inspect: &I,
-        ) -> Option<(Self::TapBody, Self::TapResponse)>;
+        ) -> (Self::TapBody, Self::TapResponse);
     }
 
     pub trait TapBody {
