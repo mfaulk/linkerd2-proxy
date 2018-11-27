@@ -16,12 +16,6 @@ use super::match_::Match;
 use proxy::http::HasH2Reason;
 use tap::{iface, Inspect};
 
-//
-const TAP_BUFFER_CAPACITY: usize = 100;
-
-// Buffer ~100 req/rsp pairs' worth of events per tap request.
-const PER_REQUEST_BUFFER_CAPACITY: usize = 400;
-
 #[derive(Clone, Debug)]
 pub struct Server<T> {
     subscribe: T,
@@ -174,7 +168,7 @@ where
         //
         // The response stream continues to process events for open streams
         // until all streams have been completed.
-        let (taps_tx, taps_rx) = mpsc::channel(TAP_BUFFER_CAPACITY);
+        let (taps_tx, taps_rx) = mpsc::channel(super::super::TAP_CAPACITY);
 
         let tap = Tap::new(Arc::downgrade(&match_handle), taps_tx);
         let subscribe = self.subscribe.subscribe(tap);
@@ -185,7 +179,7 @@ where
         // requests. Each tapped request's sender is dropped when the response
         // completes, so the event stream closes gracefully when all tapped
         // requests are completed without additional coordination.
-        let (events_tx, events_rx) = mpsc::channel(PER_REQUEST_BUFFER_CAPACITY);
+        let (events_tx, events_rx) = mpsc::channel(super::super::PER_RESPONSE_EVENT_BUFFER_CAPACITY);
 
         // Reads up to `limit` requests from from `taps_rx` and satisfies them
         // with a cpoy of `events_tx`.

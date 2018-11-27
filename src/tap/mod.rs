@@ -18,6 +18,16 @@ pub type Server = grpc::Server<daemon::Subscribe<grpc::Tap>>;
 /// services are notified of active tap requests.
 pub type Daemon = daemon::Daemon<grpc::Tap>;
 
+// The maximum number of taps that may be live in the system at once.
+const TAP_CAPACITY: usize = 100;
+
+// The maximum number of registrations that may be queued on the registration
+// channel.
+const REGISTER_CHANNEL_CAPACITY: usize = 10_000;
+
+// The number of events that may be buffered for a given response.
+const PER_RESPONSE_EVENT_BUFFER_CAPACITY: usize = 400;
+
 /// Build the tap subsystem.
 pub fn new() -> (Layer, Server, Daemon) {
     let (daemon, register, subscribe) = daemon::new();

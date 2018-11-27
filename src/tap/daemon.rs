@@ -5,13 +5,9 @@ use std::collections::VecDeque;
 
 use super::iface::Tap;
 
-const SERVICE_CAPACITY: usize = 10_000;
-
-const TAP_CAPACITY: usize = 100;
-
 pub fn new<T>() -> (Daemon<T>, Register<T>, Subscribe<T>) {
-    let (svc_tx, svc_rx) = mpsc::channel(SERVICE_CAPACITY);
-    let (tap_tx, tap_rx) = mpsc::channel(TAP_CAPACITY);
+    let (svc_tx, svc_rx) = mpsc::channel(super::REGISTER_CHANNEL_CAPACITY);
+    let (tap_tx, tap_rx) = mpsc::channel(super::TAP_CAPACITY);
 
     let daemon = Daemon {
         svc_rx,
@@ -103,7 +99,7 @@ impl<T: Tap> Future for Daemon<T> {
         // Connect newly-created taps to existing services.
         while let Ok(Async::Ready(Some((tap, ack)))) = self.tap_rx.poll() {
             trace!("subscribing a tap");
-            if self.taps.len() == TAP_CAPACITY {
+            if self.taps.len() == super::TAP_CAPACITY {
                 warn!("tap capacity exceeded");
                 drop(ack);
                 continue;
@@ -145,7 +141,7 @@ impl<T: Tap> super::iface::Register for Register<T> {
     type Taps = mpsc::Receiver<T>;
 
     fn register(&mut self) -> Self::Taps {
-        let (tx, rx) = mpsc::channel(TAP_CAPACITY);
+        let (tx, rx) = mpsc::channel(super::TAP_CAPACITY);
         if let Err(_) = self.0.try_send(tx) {
             debug!("failed to register service");
         }
