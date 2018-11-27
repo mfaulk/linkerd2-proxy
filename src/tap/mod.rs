@@ -8,13 +8,17 @@ mod daemon;
 mod grpc;
 mod service;
 
+/// Instruments service stacks so that requests may be tapped.
 pub type Layer = service::Layer<daemon::Register<grpc::Tap>>;
+
+/// A gRPC tap server.
 pub type Server = grpc::Server<daemon::Subscribe<grpc::Tap>>;
+
+/// A Future that dispatches new tap requests to services and ensures that new
+/// services are notified of active tap requests.
 pub type Daemon = daemon::Daemon<grpc::Tap>;
 
 /// Build the tap subsystem.
-///
-///
 pub fn new() -> (Layer, Server, Daemon) {
     let (daemon, register, subscribe) = daemon::new();
     let layer = Layer::new(register);
@@ -22,6 +26,9 @@ pub fn new() -> (Layer, Server, Daemon) {
     (layer, server, daemon)
 }
 
+/// Inspects a request for a `Stack`.
+///
+/// `Stack` target types
 pub trait Inspect {
     fn src_addr<B>(&self, req: &http::Request<B>) -> Option<net::SocketAddr>;
     fn src_tls<B>(&self, req: &http::Request<B>) -> tls::Status;
@@ -51,8 +58,13 @@ pub trait Inspect {
 
 /// The internal interface used between Layer, Server, and Daemon.
 ///
+/// These interfaces are provided to decouple the service implementation from any
+/// Protobuf or gRPC concerns, hopefully to make this module more testable and
+/// easier to change.
+///
 /// This module is necessary to seal the traits, which must be public
-/// forLayer/Server/Daemon to
+/// for Layer/Server/Daemon, but need not be implemented outside of the `tap`
+/// module.
 mod iface {
     use bytes::Buf;
     use futures::{Future, Stream};
@@ -62,6 +74,7 @@ mod iface {
 
     use proxy::http::HasH2Reason;
 
+    /// Registers a stack to receive taps.
     pub trait Register {
         type Tap: Tap;
         type Taps: Stream<Item = Self::Tap>;
@@ -69,10 +82,12 @@ mod iface {
         fn register(&mut self) -> Self::Taps;
     }
 
+    /// Advertises a Tap from a server to stacks.
     pub trait Subscribe<T: Tap> {
         fn subscribe(&mut self, tap: T);
     }
 
+    ///
     pub trait Tap: Clone {
         type TapRequest: TapRequest<
             TapBody = Self::TapRequestBody,
@@ -84,6 +99,7 @@ mod iface {
         type TapResponseBody: TapBody;
         type Future: Future<Item = Option<Self::TapRequest>, Error = Never>;
 
+        /// Returns `true` as l
         fn can_tap_more(&self) -> bool;
 
         fn matches<B: Payload, I: super::Inspect>(

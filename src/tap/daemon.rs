@@ -1,5 +1,5 @@
-use futures::{Async, Future, Poll, Stream};
 use futures::sync::mpsc;
+use futures::{Async, Future, Poll, Stream};
 use never::Never;
 use std::collections::VecDeque;
 
@@ -7,7 +7,7 @@ use super::iface::Tap;
 
 const SERVICE_CAPACITY: usize = 10_000;
 
-const TAP_CAPACITY: usize = 1_000;
+const TAP_CAPACITY: usize = 100;
 
 pub fn new<T>() -> (Daemon<T>, Register<T>, Subscribe<T>) {
     let (svc_tx, svc_rx) = mpsc::channel(SERVICE_CAPACITY);
@@ -24,6 +24,11 @@ pub fn new<T>() -> (Daemon<T>, Register<T>, Subscribe<T>) {
     (daemon, Register(svc_tx), Subscribe(tap_tx))
 }
 
+/// A background task that connects a tap server and proxy services.
+///
+/// The daemon provides `Register` to allow proxy services to listen for new
+/// taps; and it provides `Subscribe` to allow the tap server to advertise new
+/// taps to proxy services.
 #[must_use = "daemon must be polled"]
 #[derive(Debug)]
 pub struct Daemon<T> {
@@ -46,21 +51,36 @@ impl<T: Tap> Future for Daemon<T> {
 
     fn poll(&mut self) -> Poll<(), Never> {
         // Drop taps that are no longer active (i.e. the response stream has
-        // been droped).
+        // been dropped).
         let tap_count = self.taps.len();
         self.taps.retain(|t| t.can_tap_more());
         trace!("retained {} of {} taps", self.taps.len(), tap_count);
+
+        // Drop services that are no longer active (i.e. the response stream has
+        // been droped).
+        for idx in (0..self.svcs.len()).rev() {
+            // It's "okay" if a service isn't ready to receive taps. We just
+            // fall back to being lossy rather than dropping the service
+            // entirely.
+            if self.svcs[idx].poll_ready().is_err() {
+                trace!("removing a service");
+                self.svcs.swap_remove_back(idx);
+            }
+        }
 
         // Connect newly-created services to active taps.
         while let Ok(Async::Ready(Some(mut svc))) = self.svc_rx.poll() {
             trace!("registering a service");
 
-            // Notify the service of all active taps. If there's an error, the
-            // registration is dropped.
+            // Notify the service of all active taps. If the service has been
+            // dropped, it wll not be added.
             let mut is_ok = true;
             for tap in &self.taps {
-                if is_ok {
-                    is_ok = svc.try_send(tap.clone()).is_ok();
+                debug_assert!(is_ok);
+                let t = tap.clone();
+                is_ok = svc.try_send(t).err().map(|e| e.is_full()).unwrap_or(true);
+                if !is_ok {
+                    break;
                 }
             }
 
@@ -81,7 +101,8 @@ impl<T: Tap> Future for Daemon<T> {
             // given service, it's assumed that the service has been dropped, so
             // it is removed from the registry.
             for idx in (0..self.svcs.len()).rev() {
-                if self.svcs[idx].try_send(tap.clone()).is_err() {
+                let err = self.svcs[idx].try_send(tap.clone()).err();
+                if err.map(|e| e.is_disconnected()).unwrap_or(false) {
                     trace!("removing a service");
                     self.svcs.swap_remove_back(idx);
                 }

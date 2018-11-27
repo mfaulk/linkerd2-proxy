@@ -16,7 +16,7 @@ use super::match_::Match;
 use proxy::http::HasH2Reason;
 use tap::{iface, Inspect};
 
-// Buffer ~100 req/rsp pairs' worth of events per tap request.
+//
 const TAP_BUFFER_CAPACITY: usize = 100;
 
 // Buffer ~100 req/rsp pairs' worth of events per tap request.
@@ -57,13 +57,13 @@ pub struct Tap {
 }
 
 #[derive(Debug)]
-pub struct TapFuture(Fut);
+pub struct TapFuture(FutState);
 
 #[derive(Debug)]
-enum Fut {
+enum FutState {
     Init {
         request_init_at: Instant,
-        taps_tx: mpsc::Sender<oneshot::Sender<TapTx>>
+        taps_tx: mpsc::Sender<oneshot::Sender<TapTx>>,
     },
     Pending {
         request_init_at: Instant,
@@ -98,6 +98,8 @@ pub struct TapResponseBody {
     response_bytes: usize,
     tap: TapTx,
 }
+
+// === impl Server ===
 
 impl<T: iface::Subscribe<Tap>> Server<T> {
     pub(in tap) fn new(subscribe: T) -> Self {
@@ -196,6 +198,8 @@ where
     }
 }
 
+// === impl ResponseStream ===
+
 impl Stream for ResponseStream {
     type Item = api::TapEvent;
     type Error = grpc::Error;
@@ -203,36 +207,46 @@ impl Stream for ResponseStream {
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         // Drop the dispatch future once it completes so that services do not do
         // any more matching against this tap.
+        //
+        // Furthermore, this drops the event sender so that `events_rx` closes
+        // gracefully when all open taps are complete.
         self.dispatch = self.dispatch.take().and_then(|mut d| match d.poll() {
             Ok(Async::NotReady) => Some(d),
             Ok(Async::Ready(())) | Err(_) => None,
         });
 
-        let poll: Poll<Option<Self::Item>, Self::Error> =
-            self.events_rx.poll().or_else(|_| Ok(None.into()));
-        let event = try_ready!(poll);
-        trace!("ResponseStream::poll: event={:?}", event);
-        Ok(event.into())
+        // Read events from taps. The receiver can't actually error, but we need
+        // to satisfy the type signature, so we coerce errors into EOS.
+        self.events_rx.poll().or_else(|_| Ok(None.into()))
     }
 }
+
+// === impl Dispatch ===
 
 impl Future for Dispatch {
     type Item = ();
     type Error = ();
 
+    /// Read tap requests, assign each an ID and send it back to the requesting
+    /// service with an event sender so that it may emittap events.
+    ///
+    /// Becomes ready when the limit has been reached.
     fn poll(&mut self) -> Poll<(), Self::Error> {
         while let Some(tx) = try_ready!(self.taps_rx.poll().map_err(|_| ())) {
             debug_assert!(self.count < self.limit - 1);
 
             self.count += 1;
             let tap = TapTx {
+                tx: self.events_tx.clone(),
                 id: api::tap_event::http::StreamId {
                     base: self.base_id,
                     stream: self.count as u64,
                 },
-                tx: self.events_tx.clone(),
             };
-            let _ = tx.send(tap);
+            if tx.send(tap).is_err() {
+                // If the tap isn't sent, then restore the count.
+                self.count -= 1;
+            }
 
             if self.count == self.limit - 1 {
                 return Ok(Async::Ready(()));
@@ -243,35 +257,11 @@ impl Future for Dispatch {
     }
 }
 
+// === impl Tap ===
+
 impl Tap {
     fn new(match_: Weak<Match>, taps_tx: mpsc::Sender<oneshot::Sender<TapTx>>) -> Self {
         Self { match_, taps_tx }
-    }
-
-    fn base_event<B, I: Inspect>(req: &http::Request<B>, inspect: &I) -> api::TapEvent {
-        api::TapEvent {
-            proxy_direction: if inspect.is_outbound(req) {
-                api::tap_event::ProxyDirection::Outbound.into()
-            } else {
-                api::tap_event::ProxyDirection::Inbound.into()
-            },
-            source: inspect.src_addr(req).as_ref().map(|a| a.into()),
-            source_meta: {
-                let mut m = api::tap_event::EndpointMeta::default();
-                let tls = format!("{}", inspect.src_tls(req));
-                m.labels.insert("tls".to_owned(), tls);
-                Some(m)
-            },
-            destination: inspect.dst_addr(req).as_ref().map(|a| a.into()),
-            destination_meta: inspect.dst_labels(req).map(|labels| {
-                let mut m = api::tap_event::EndpointMeta::default();
-                m.labels.extend(labels.clone());
-                let tls = format!("{}", inspect.dst_tls(req));
-                m.labels.insert("tls".to_owned(), tls);
-                m
-            }),
-            event: None,
-        }
     }
 }
 
@@ -286,21 +276,22 @@ impl iface::Tap for Tap {
         self.match_.upgrade().is_some()
     }
 
-    fn matches<B: Payload, I: Inspect>(
-        &self,
-        req: &http::Request<B>,
-        inspect: &I,
-    ) -> bool {
-        self.match_.upgrade().map(|m| m.matches(req, inspect)).unwrap_or(false)
+    fn matches<B: Payload, I: Inspect>(&self, req: &http::Request<B>, inspect: &I) -> bool {
+        self.match_
+            .upgrade()
+            .map(|m| m.matches(req, inspect))
+            .unwrap_or(false)
     }
 
     fn tap(&mut self) -> Self::Future {
-        TapFuture(Fut::Init {
+        TapFuture(FutState::Init {
             request_init_at: clock::now(),
             taps_tx: self.taps_tx.clone(),
         })
     }
 }
+
+// === impl TapFuture ===
 
 impl Future for TapFuture {
     type Item = Option<TapRequest>;
@@ -309,7 +300,10 @@ impl Future for TapFuture {
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         loop {
             self.0 = match self.0 {
-                Fut::Init { ref request_init_at, ref mut taps_tx } => {
+                FutState::Init {
+                    ref request_init_at,
+                    ref mut taps_tx,
+                } => {
                     match taps_tx.poll_ready() {
                         Ok(Async::NotReady) => return Ok(Async::NotReady),
                         Ok(Async::Ready(())) => {}
@@ -320,26 +314,33 @@ impl Future for TapFuture {
                     // If this fails, polling `rx` will fail below.
                     let _ = taps_tx.try_send(tx);
 
-                    Fut::Pending {
+                    FutState::Pending {
                         request_init_at: *request_init_at,
                         rx,
                     }
                 }
-                Fut::Pending { ref request_init_at, ref mut rx } => {
-                    let tap = match rx.poll() {
-                        Ok(Async::NotReady) => return Ok(Async::NotReady),
-                        Ok(Async::Ready(tap)) => Some(TapRequest {
-                            request_init_at: *request_init_at,
-                            tap,
-                        }),
-                        Err(_) => None,
+                FutState::Pending {
+                    ref request_init_at,
+                    ref mut rx,
+                } => {
+                    return match rx.poll() {
+                        Ok(Async::NotReady) => Ok(Async::NotReady),
+                        Ok(Async::Ready(tap)) => {
+                            let t = TapRequest {
+                                request_init_at: *request_init_at,
+                                tap,
+                            };
+                            Ok(Some(t).into())
+                        }
+                        Err(_) => Ok(None.into()),
                     };
-                    return Ok(Async::Ready(tap));
                 }
             }
         }
     }
 }
+
+// === impl TapRequest ===
 
 impl iface::TapRequest for TapRequest {
     type TapBody = TapRequestBody;
@@ -350,17 +351,14 @@ impl iface::TapRequest for TapRequest {
         mut self,
         req: &http::Request<B>,
         inspect: &I,
-     ) -> (TapRequestBody, TapResponse) {
-        // All of the events emitted from tap have a common set of metadata.
-        // Build this once, without an `event`, so that it can be used to build
-        // each HTTP event.
-        let base_event = Tap::base_event(req, inspect);
+    ) -> (TapRequestBody, TapResponse) {
+        let base_event = base_event(req, inspect);
 
         let init = api::tap_event::http::RequestInit {
             id: Some(self.tap.id.clone()),
             method: Some(req.method().into()),
             scheme: req.uri().scheme_part().map(http_types::Scheme::from),
-            authority: inspect.authority(req).unwrap_or_default().to_owned(),
+            authority: inspect.authority(req).unwrap_or_default(),
             path: req.uri().path().into(),
         };
 ;
@@ -384,6 +382,9 @@ impl iface::TapRequest for TapRequest {
         (req, rsp)
     }
 }
+
+// === impl TapResponse ===
+
 impl iface::TapResponse for TapResponse {
     type TapBody = TapResponseBody;
 
@@ -435,6 +436,8 @@ impl iface::TapResponse for TapResponse {
     }
 }
 
+// === impl TapRequestBody ===
+
 impl iface::TapBody for TapRequestBody {
     fn data<B: Buf>(&mut self, _: &B) {}
 
@@ -442,6 +445,8 @@ impl iface::TapBody for TapRequestBody {
 
     fn fail(self, _: &h2::Error) {}
 }
+
+// === impl TapResponseBody ===
 
 impl iface::TapBody for TapResponseBody {
     fn data<B: Buf>(&mut self, data: &B) {
@@ -467,21 +472,49 @@ impl iface::TapBody for TapResponseBody {
 impl TapResponseBody {
     fn send(mut self, end: Option<api::eos::End>) {
         let response_end_at = clock::now();
-
-        let end = api::tap_event::http::Event::ResponseEnd(api::tap_event::http::ResponseEnd {
-            id: Some(self.tap.id.clone()),
+        let end = api::tap_event::http::ResponseEnd {
+            id: Some(self.tap.id),
             since_request_init: Some(pb_duration(response_end_at - self.request_init_at)),
             since_response_init: Some(pb_duration(response_end_at - self.response_init_at)),
             response_bytes: self.response_bytes as u64,
             eos: Some(api::Eos { end }),
-        });
+        };
 
         let event = api::TapEvent {
             event: Some(api::tap_event::Event::Http(api::tap_event::Http {
-                event: Some(end),
+                event: Some(api::tap_event::http::Event::ResponseEnd(end)),
             })),
             ..self.base_event
         };
         let _ = self.tap.tx.try_send(event);
+    }
+}
+
+// All of the events emitted from tap have a common set of metadata.
+// Build this once, without an `event`, so that it can be used to build
+// each HTTP event.
+fn base_event<B, I: Inspect>(req: &http::Request<B>, inspect: &I) -> api::TapEvent {
+    api::TapEvent {
+        proxy_direction: if inspect.is_outbound(req) {
+            api::tap_event::ProxyDirection::Outbound.into()
+        } else {
+            api::tap_event::ProxyDirection::Inbound.into()
+        },
+        source: inspect.src_addr(req).as_ref().map(|a| a.into()),
+        source_meta: {
+            let mut m = api::tap_event::EndpointMeta::default();
+            let tls = format!("{}", inspect.src_tls(req));
+            m.labels.insert("tls".to_owned(), tls);
+            Some(m)
+        },
+        destination: inspect.dst_addr(req).as_ref().map(|a| a.into()),
+        destination_meta: inspect.dst_labels(req).map(|labels| {
+            let mut m = api::tap_event::EndpointMeta::default();
+            m.labels.extend(labels.clone());
+            let tls = format!("{}", inspect.dst_tls(req));
+            m.labels.insert("tls".to_owned(), tls);
+            m
+        }),
+        event: None,
     }
 }

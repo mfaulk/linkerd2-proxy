@@ -32,7 +32,19 @@ pub struct Service<I, R, T, S> {
     inspect: I,
 }
 
-pub enum ResponseFuture<
+/// Fetches `TapRequest`s, instruments messages to be tapped, and executes a
+/// request.
+pub struct ResponseFuture<I, T, A, S>
+where
+    I: Inspect,
+    T: Tap,
+    A: Payload,
+    S: svc::Service<http::Request<Body<A, T::TapRequestBody>>>,
+{
+    state: FutState<I, T, A, S>,
+}
+
+enum FutState<
     I: Inspect,
     T: Tap,
     A: Payload,
@@ -50,6 +62,7 @@ pub enum ResponseFuture<
     },
 }
 
+// A `Payload` instrumented with taps.
 #[derive(Debug)]
 pub struct Body<B: Payload, T: TapBody> {
     inner: B,
@@ -126,27 +139,33 @@ where
     type Future = ResponseFuture<I, T, A, S>;
 
     fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+        // Load new taps from the tap server.
         while let Ok(Async::Ready(Some(t))) = self.tap_rx.poll() {
             self.taps.push_back(t);
         }
-
+        // Drop taps that have been canceled or completed.
         self.taps.retain(|t| t.can_tap_more());
+
         self.inner.poll_ready()
     }
 
     fn call(&mut self, req: http::Request<A>) -> Self::Future {
-        let mut taps = VecDeque::with_capacity(self.taps.len());
+        // Determine which active taps match the request and collect all of the
+        // futures requesting TapRequests from the tap server.
+        let mut tap_futs = VecDeque::with_capacity(self.taps.len());
         for t in self.taps.iter_mut() {
             if t.matches(&req, &self.inspect) {
-                taps.push_back(t.tap());
+                tap_futs.push_back(t.tap());
             }
         }
 
-        ResponseFuture::Taps {
-            taps: future::join_all(taps),
-            request: Some(req),
-            service: self.inner.clone(),
-            inspect: self.inspect.clone(),
+        ResponseFuture {
+            state: FutState::Taps {
+                taps: future::join_all(tap_futs),
+                request: Some(req),
+                service: self.inner.clone(),
+                inspect: self.inspect.clone(),
+            },
         }
     }
 }
@@ -164,15 +183,18 @@ where
     type Error = S::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        // Drive the state machine from FutState::Taps to FutState::Call to Ready.
         loop {
-            *self = match self {
-                ResponseFuture::Taps {
-                    request,
-                    service,
-                    taps,
-                    inspect,
+            self.state = match self.state {
+                FutState::Taps {
+                    ref mut request,
+                    ref mut service,
+                    ref mut taps,
+                    ref inspect,
                 } => {
-                    let taps = match taps.poll() {
+                    // Get all the tap requests. If there's any sort of error,
+                    // continue without taps.
+                    let mut taps = match taps.poll() {
                         Ok(Async::NotReady) => return Ok(Async::NotReady),
                         Ok(Async::Ready(taps)) => taps,
                         Err(_) => Vec::new(),
@@ -180,14 +202,17 @@ where
 
                     let req = request.take().expect("request must be set");
 
+                    // Record the request as being opened in all TapRequests
+                    // and then
                     let mut req_taps = VecDeque::with_capacity(taps.len());
                     let mut rsp_taps = VecDeque::with_capacity(taps.len());
-                    for tap in taps.into_iter().filter_map(|t| t) {
+                    for tap in taps.drain(..).filter_map(|t| t) {
                         let (req, rsp) = tap.open(&req, inspect);
                         req_taps.push_back(req);
                         rsp_taps.push_back(rsp);
                     }
 
+                    // Install the request taps into the request body.
                     let req = {
                         let (head, inner) = req.into_parts();
                         let body = Body {
@@ -197,17 +222,23 @@ where
                         http::Request::from_parts(head, body)
                     };
 
+                    // Call the service with the decorated request and save the
+                    // response taps for when the call completes.
                     let call = service.call(req);
-
-                    ResponseFuture::Call {
+                    FutState::Call {
                         call,
                         taps: rsp_taps,
                     }
                 }
-                ResponseFuture::Call { call, taps } => {
+                FutState::Call {
+                    ref mut call,
+                    ref mut taps,
+                } => {
                     return match call.poll() {
                         Ok(Async::NotReady) => Ok(Async::NotReady),
                         Ok(Async::Ready(rsp)) => {
+                            // Tap the response headers and use the response
+                            // body taps to decorate the response body.
                             let taps = taps.drain(..).map(|t| t.tap(&rsp)).collect();
                             let (head, inner) = rsp.into_parts();
                             let mut body = Body { inner, taps };
@@ -231,6 +262,7 @@ where
 
 // === Body ===
 
+// `T` need not implement Default.
 impl<B: Payload + Default, T: TapBody> Default for Body<B, T> {
     fn default() -> Self {
         Self {
@@ -291,7 +323,6 @@ impl<B: Payload, T: TapBody> Body<B, T> {
 
 impl<B: Payload, T: TapBody> Drop for Body<B, T> {
     fn drop(&mut self) {
-        // TODO this should be recorded as a cancelation if the stream didn't end.
         self.eos(None);
     }
 }
