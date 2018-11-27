@@ -31,10 +31,8 @@ pub struct Server<T> {
 #[derive(Debug)]
 pub struct ResponseFuture<F> {
     subscribe: F,
-    base_id: u32,
-    limit: usize,
-    taps_rx: Option<mpsc::Receiver<oneshot::Sender<TapTx>>>,
-    match_: Arc<Match>,
+    dispatch: Option<Dispatch>,
+    events_rx: Option<mpsc::Receiver<api::TapEvent>>,
 }
 
 #[derive(Debug)]
@@ -149,7 +147,7 @@ where
         // services to match requests. The response stream strongly holds the
         // match until the response is complete. This way, services never
         // evaluate matches for taps that have been completed or canceled.
-        let match_ = match Match::try_new(req.match_) {
+        let match_handle = match Match::try_new(req.match_) {
             Ok(m) => Arc::new(m),
             Err(e) => {
                 warn!("invalid tap request: {} ", e);
@@ -163,7 +161,7 @@ where
         // Wrapping is okay. This is realy just to disambiguate events within a
         // single tap session (i.e. that may consist of several tap requests).
         let base_id = self.base_id.fetch_add(1, Ordering::AcqRel) as u32;
-        debug!("tap; id={}; match={:?}", base_id, match_);
+        debug!("tap; id={}; match={:?}", base_id, match_handle);
 
         // The taps channel is used by services to acquire a `TapTx` for
         // `Dispatch`, i.e. ensuring that no more than the requested number of
@@ -178,34 +176,8 @@ where
         // until all streams have been completed.
         let (taps_tx, taps_rx) = mpsc::channel(TAP_BUFFER_CAPACITY);
 
-        let tap = Tap::new(Arc::downgrade(&match_), taps_tx);
+        let tap = Tap::new(Arc::downgrade(&match_handle), taps_tx);
         let subscribe = self.subscribe.subscribe(tap);
-
-        future::Either::B(ResponseFuture {
-            base_id,
-            limit,
-            match_: match_.clone(),
-            taps_rx: Some(taps_rx),
-            subscribe,
-        })
-    }
-}
-
-impl<F: Future<Item = ()>> Future for ResponseFuture<F> {
-    type Item = Response<ResponseStream>;
-    type Error = grpc::Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.subscribe.poll() {
-            Ok(Async::NotReady) => return Ok(Async::NotReady),
-            Ok(Async::Ready(())) => {}
-            Err(_) => {
-                let status = grpc::Status::with_code(grpc::Code::ResourceExhausted);
-                let mut headers = HeaderMap::new();
-                headers.insert("grpc-message", "Too many active taps".parse().unwrap());
-                return Err(grpc::Error::Grpc(status, headers));
-            }
-        }
 
         // The events channel is used to emit tap events to the response stream.
         //
@@ -218,17 +190,42 @@ impl<F: Future<Item = ()>> Future for ResponseFuture<F> {
         // Reads up to `limit` requests from from `taps_rx` and satisfies them
         // with a cpoy of `events_tx`.
         let dispatch = Dispatch {
-            base_id: self.base_id,
+            base_id,
             count: 0,
-            limit: self.limit,
-            taps_rx: self.taps_rx.take().expect("taps_rx must be set"),
+            limit,
+            taps_rx,
             events_tx,
-            match_handle: self.match_.clone(),
+            match_handle,
         };
 
-        let rsp = ResponseStream {
+        future::Either::B(ResponseFuture {
+            subscribe,
             dispatch: Some(dispatch),
-            events_rx,
+            events_rx: Some(events_rx),
+        })
+    }
+}
+
+impl<F: Future<Item = ()>> Future for ResponseFuture<F> {
+    type Item = Response<ResponseStream>;
+    type Error = grpc::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        // Ensure that tap registers successfully.
+        match self.subscribe.poll() {
+            Ok(Async::NotReady) => return Ok(Async::NotReady),
+            Ok(Async::Ready(())) => {}
+            Err(_) => {
+                let status = grpc::Status::with_code(grpc::Code::ResourceExhausted);
+                let mut headers = HeaderMap::new();
+                headers.insert("grpc-message", "Too many active taps".parse().unwrap());
+                return Err(grpc::Error::Grpc(status, headers));
+            }
+        }
+
+        let rsp = ResponseStream {
+            dispatch: self.dispatch.take(),
+            events_rx: self.events_rx.take().expect("events_rx must be set"),
         };
 
         Ok(Response::new(rsp).into())
