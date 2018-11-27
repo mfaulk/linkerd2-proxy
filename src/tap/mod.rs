@@ -96,6 +96,9 @@ mod iface {
     pub trait Subscribe<T: Tap> {
         type Future: Future<Item = (), Error = NoCapacity>;
 
+        /// Returns a `Future` that succeeds when the tap has been registered.
+        ///
+        /// If the tap cannot be registered, a `NoCapacity` error is returned.
         fn subscribe(&mut self, tap: T) -> Self::Future;
     }
 
@@ -114,12 +117,17 @@ mod iface {
         /// Returns `true` as l
         fn can_tap_more(&self) -> bool;
 
-        fn matches<B: Payload, I: super::Inspect>(
+        /// Determines whether a request should be tapped.
+        fn should_tap<B: Payload, I: super::Inspect>(
             &self,
             req: &http::Request<B>,
             inspect: &I,
         ) -> bool;
 
+        /// Initiate a tap.
+        ///
+        /// If the tap cannot be initialized, for instance because the tap has
+        /// completed or been canceled, then `None` is returned.
         fn tap(&mut self) -> Self::Future;
     }
 
@@ -128,6 +136,7 @@ mod iface {
         type TapResponse: TapResponse<TapBody = Self::TapResponseBody>;
         type TapResponseBody: TapBody;
 
+        /// Start tapping a request, obtaining handles to tap its body and response.
         fn open<B: Payload, I: super::Inspect>(
             self,
             req: &http::Request<B>,
@@ -146,8 +155,10 @@ mod iface {
     pub trait TapResponse {
         type TapBody: TapBody;
 
+        /// Record a response and obtain a handle to tap its body.
         fn tap<B: Payload>(self, rsp: &http::Response<B>) -> Self::TapBody;
 
+        /// Record a service failure.
         fn fail<E: HasH2Reason>(self, error: &E);
     }
 

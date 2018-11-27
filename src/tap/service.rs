@@ -154,7 +154,7 @@ where
         // futures requesting TapRequests from the tap server.
         let mut tap_futs = VecDeque::with_capacity(self.taps.len());
         for t in self.taps.iter_mut() {
-            if t.matches(&req, &self.inspect) {
+            if t.should_tap(&req, &self.inspect) {
                 tap_futs.push_back(t.tap());
             }
         }

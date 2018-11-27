@@ -179,7 +179,8 @@ where
         // requests. Each tapped request's sender is dropped when the response
         // completes, so the event stream closes gracefully when all tapped
         // requests are completed without additional coordination.
-        let (events_tx, events_rx) = mpsc::channel(super::super::PER_RESPONSE_EVENT_BUFFER_CAPACITY);
+        let (events_tx, events_rx) =
+            mpsc::channel(super::super::PER_RESPONSE_EVENT_BUFFER_CAPACITY);
 
         // Reads up to `limit` requests from from `taps_rx` and satisfies them
         // with a cpoy of `events_tx`.
@@ -304,7 +305,7 @@ impl iface::Tap for Tap {
         self.match_.upgrade().is_some()
     }
 
-    fn matches<B: Payload, I: Inspect>(&self, req: &http::Request<B>, inspect: &I) -> bool {
+    fn should_tap<B: Payload, I: Inspect>(&self, req: &http::Request<B>, inspect: &I) -> bool {
         self.match_
             .upgrade()
             .map(|m| m.matches(req, inspect))
