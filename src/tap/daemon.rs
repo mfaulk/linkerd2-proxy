@@ -1,4 +1,4 @@
-use futures::sync::mpsc;
+use futures::sync::{mpsc, oneshot};
 use futures::{Async, Future, Poll, Stream};
 use never::Never;
 use std::collections::VecDeque;
@@ -35,7 +35,7 @@ pub struct Daemon<T> {
     svc_rx: mpsc::Receiver<mpsc::Sender<T>>,
     svcs: VecDeque<mpsc::Sender<T>>,
 
-    tap_rx: mpsc::Receiver<T>,
+    tap_rx: mpsc::Receiver<(T, oneshot::Sender<()>)>,
     taps: VecDeque<T>,
 }
 
@@ -43,7 +43,17 @@ pub struct Daemon<T> {
 pub struct Register<T>(mpsc::Sender<mpsc::Sender<T>>);
 
 #[derive(Debug)]
-pub struct Subscribe<T>(mpsc::Sender<T>);
+pub struct Subscribe<T>(mpsc::Sender<(T, oneshot::Sender<()>)>);
+
+pub struct SubscribeFuture<T>(FutState<T>);
+
+enum FutState<T> {
+    Subscribe {
+        tap: Option<T>,
+        tap_tx: mpsc::Sender<(T, oneshot::Sender<()>)>,
+    },
+    Pending(oneshot::Receiver<()>),
+}
 
 impl<T: Tap> Future for Daemon<T> {
     type Item = ();
@@ -91,9 +101,16 @@ impl<T: Tap> Future for Daemon<T> {
         }
 
         // Connect newly-created taps to existing services.
-        while let Ok(Async::Ready(Some(tap))) = self.tap_rx.poll() {
+        while let Ok(Async::Ready(Some((tap, ack)))) = self.tap_rx.poll() {
             trace!("subscribing a tap");
+            if self.taps.len() == TAP_CAPACITY {
+                warn!("tap capacity exceeded");
+                drop(ack);
+                continue;
+            }
             if !tap.can_tap_more() {
+                trace!("tap already dropped");
+                drop(ack);
                 continue;
             }
 
@@ -109,6 +126,7 @@ impl<T: Tap> Future for Daemon<T> {
             }
 
             self.taps.push_back(tap);
+            let _ = ack.send(());
             trace!("tap subscribed");
         }
 
@@ -142,9 +160,41 @@ impl<T: Tap> Clone for Subscribe<T> {
 }
 
 impl<T: Tap> super::iface::Subscribe<T> for Subscribe<T> {
-    fn subscribe(&mut self, tap: T) {
-        if let Err(_) = self.0.try_send(tap) {
-            debug!("failed to subscribe tap");
+    type Future = SubscribeFuture<T>;
+
+    fn subscribe(&mut self, tap: T) -> Self::Future {
+        SubscribeFuture(FutState::Subscribe {
+            tap: Some(tap),
+            tap_tx: self.0.clone(),
+        })
+    }
+}
+
+impl<T: Tap> Future for SubscribeFuture<T> {
+    type Item = ();
+    type Error = super::iface::NoCapacity;
+
+    fn poll(&mut self) -> Poll<(), Self::Error> {
+        loop {
+            self.0 = match self.0 {
+                FutState::Subscribe {
+                    ref mut tap,
+                    ref mut tap_tx,
+                } => {
+                    try_ready!(tap_tx.poll_ready().map_err(|_| super::iface::NoCapacity));
+
+                    let tap = tap.take().expect("tap must be set");
+                    let (tx, rx) = oneshot::channel();
+                    tap_tx
+                        .try_send((tap, tx))
+                        .map_err(|_| super::iface::NoCapacity)?;
+
+                    FutState::Pending(rx)
+                }
+                FutState::Pending(ref mut rx) => {
+                    return rx.poll().map_err(|_| super::iface::NoCapacity);
+                }
+            }
         }
     }
 }

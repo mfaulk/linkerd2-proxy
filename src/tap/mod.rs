@@ -84,7 +84,9 @@ mod iface {
 
     /// Advertises a Tap from a server to stacks.
     pub trait Subscribe<T: Tap> {
-        fn subscribe(&mut self, tap: T);
+        type Future: Future<Item = (), Error = NoCapacity>;
+
+        fn subscribe(&mut self, tap: T) -> Self::Future;
     }
 
     ///
@@ -138,4 +140,16 @@ mod iface {
 
         fn fail<E: HasH2Reason>(self, error: &E);
     }
+
+    #[derive(Debug)]
+    pub struct NoCapacity;
+
+    impl ::std::fmt::Display for NoCapacity {
+        fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+            write!(f, "capacity exhausted")
+        }
+    }
+
+    impl ::std::error::Error for NoCapacity {}
+
 }

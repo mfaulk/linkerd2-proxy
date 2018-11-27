@@ -29,6 +29,15 @@ pub struct Server<T> {
 }
 
 #[derive(Debug)]
+pub struct ResponseFuture<F> {
+    subscribe: F,
+    base_id: u32,
+    limit: usize,
+    taps_rx: Option<mpsc::Receiver<oneshot::Sender<TapTx>>>,
+    match_: Arc<Match>,
+}
+
+#[derive(Debug)]
 pub struct ResponseStream {
     dispatch: Option<Dispatch>,
     events_rx: mpsc::Receiver<api::TapEvent>,
@@ -41,7 +50,7 @@ struct Dispatch {
     limit: usize,
     taps_rx: mpsc::Receiver<oneshot::Sender<TapTx>>,
     events_tx: mpsc::Sender<api::TapEvent>,
-    _match: Arc<Match>,
+    match_handle: Arc<Match>,
 }
 
 #[derive(Clone, Debug)]
@@ -120,7 +129,10 @@ where
     T: iface::Subscribe<Tap> + Clone,
 {
     type ObserveStream = ResponseStream;
-    type ObserveFuture = future::FutureResult<Response<Self::ObserveStream>, grpc::Error>;
+    type ObserveFuture = future::Either<
+        future::FutureResult<Response<Self::ObserveStream>, grpc::Error>,
+        ResponseFuture<T::Future>,
+    >;
 
     fn observe(&mut self, req: grpc::Request<api::ObserveRequest>) -> Self::ObserveFuture {
         let req = req.into_inner();
@@ -128,7 +140,7 @@ where
         let limit = req.limit as usize;
         if limit == 0 {
             let v = http::header::HeaderValue::from_static("limit must be positive");
-            return future::err(Self::invalid_arg(v));
+            return future::Either::A(future::err(Self::invalid_arg(v)));
         };
         trace!("tap: limit={}", limit);
 
@@ -144,7 +156,7 @@ where
                 let v = format!("{}", e)
                     .parse()
                     .unwrap_or_else(|_| http::header::HeaderValue::from_static("invalid message"));
-                return future::err(Self::invalid_arg(v));
+                return future::Either::A(future::err(Self::invalid_arg(v)));
             }
         };
 
@@ -166,9 +178,34 @@ where
         // until all streams have been completed.
         let (taps_tx, taps_rx) = mpsc::channel(TAP_BUFFER_CAPACITY);
 
-        // This tap is cloned onto each
         let tap = Tap::new(Arc::downgrade(&match_), taps_tx);
-        self.subscribe.subscribe(tap);
+        let subscribe = self.subscribe.subscribe(tap);
+
+        future::Either::B(ResponseFuture {
+            base_id,
+            limit,
+            match_: match_.clone(),
+            taps_rx: Some(taps_rx),
+            subscribe,
+        })
+    }
+}
+
+impl<F: Future<Item = ()>> Future for ResponseFuture<F> {
+    type Item = Response<ResponseStream>;
+    type Error = grpc::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        match self.subscribe.poll() {
+            Ok(Async::NotReady) => return Ok(Async::NotReady),
+            Ok(Async::Ready(())) => {}
+            Err(_) => {
+                let status = grpc::Status::with_code(grpc::Code::ResourceExhausted);
+                let mut headers = HeaderMap::new();
+                headers.insert("grpc-message", "Too many active taps".parse().unwrap());
+                return Err(grpc::Error::Grpc(status, headers));
+            }
+        }
 
         // The events channel is used to emit tap events to the response stream.
         //
@@ -181,12 +218,12 @@ where
         // Reads up to `limit` requests from from `taps_rx` and satisfies them
         // with a cpoy of `events_tx`.
         let dispatch = Dispatch {
-            base_id,
+            base_id: self.base_id,
             count: 0,
-            limit,
-            taps_rx,
+            limit: self.limit,
+            taps_rx: self.taps_rx.take().expect("taps_rx must be set"),
             events_tx,
-            _match: match_,
+            match_handle: self.match_.clone(),
         };
 
         let rsp = ResponseStream {
@@ -194,7 +231,7 @@ where
             events_rx,
         };
 
-        future::ok(Response::new(rsp))
+        Ok(Response::new(rsp).into())
     }
 }
 
