@@ -10,7 +10,7 @@ use drain;
 use never::Never;
 use svc::{Stack, Service};
 use transport::{connect, tls, Connection, GetOriginalDst, Peek};
-use proxy::http::glue::{HttpBody, HyperServerSvc};
+use proxy::http::{glue::{HttpBody, HyperServerSvc}, upgrade};
 use proxy::protocol::Protocol;
 use proxy::tcp;
 use super::Accept;
@@ -280,7 +280,7 @@ where
                 (p, io)
             });
 
-        let http = self.http.clone();
+        let mut http = self.http.clone();
         let route = self.route.clone();
         let connect = self.connect.clone();
         let drain_signal = self.drain_signal.clone();
@@ -299,13 +299,15 @@ where
                         match route.make(&source) {
                             Err(never) => match never {},
                             Ok(s) => {
-                                let svc = HyperServerSvc::new(
+                                // Enable support for HTTP upgrades (CONNECT and websockets).
+                                let svc = upgrade::Service::new(
                                     s,
                                     drain_signal.clone(),
                                     log_clone.executor(),
                                 );
-                                // Enable support for HTTP upgrades (CONNECT and websockets).
+                                let svc = HyperServerSvc::new(svc);
                                 let conn = http
+                                    .http1_only(true)
                                     .serve_connection(io, svc)
                                     .with_upgrades();
                                 drain_signal
@@ -322,12 +324,10 @@ where
                         match route.make(&source) {
                             Err(never) => match never {},
                             Ok(s) => {
-                                let svc = HyperServerSvc::new(
-                                    s,
-                                    drain_signal.clone(),
-                                    log_clone.executor(),
-                                );
+                                let svc = HyperServerSvc::new(s);
                                 let conn = http
+                                    .with_executor(log_clone.executor())
+                                    .http2_only(true)
                                     .serve_connection(io, svc);
                                 drain_signal
                                     .watch(conn, |conn| {
