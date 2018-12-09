@@ -1,7 +1,6 @@
 use bytes::Buf;
 use futures::sync::{mpsc, oneshot};
 use futures::{future, Async, Future, Poll, Stream};
-use http::HeaderMap;
 use hyper::body::Payload;
 use never::Never;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -110,11 +109,9 @@ impl<T: iface::Subscribe<Tap>> Server<T> {
         Self { base_id, subscribe }
     }
 
-    fn invalid_arg(event: http::header::HeaderValue) -> grpc::Error {
+    fn invalid_arg() -> grpc::Error {
         let status = grpc::Status::with_code(grpc::Code::InvalidArgument);
-        let mut headers = HeaderMap::new();
-        headers.insert("grpc-message", event);
-        grpc::Error::Grpc(status, headers)
+        grpc::Error::Grpc(status)
     }
 }
 
@@ -133,8 +130,7 @@ where
 
         let limit = req.limit as usize;
         if limit == 0 {
-            let v = http::header::HeaderValue::from_static("limit must be positive");
-            return future::Either::A(future::err(Self::invalid_arg(v)));
+            return future::Either::A(future::err(Self::invalid_arg()));
         };
         trace!("tap: limit={}", limit);
 
@@ -147,10 +143,7 @@ where
             Ok(m) => Arc::new(m),
             Err(e) => {
                 warn!("invalid tap request: {} ", e);
-                let v = format!("{}", e)
-                    .parse()
-                    .unwrap_or_else(|_| http::header::HeaderValue::from_static("invalid message"));
-                return future::Either::A(future::err(Self::invalid_arg(v)));
+                return future::Either::A(future::err(Self::invalid_arg()));
             }
         };
 
@@ -214,9 +207,7 @@ impl<F: Future<Item = ()>> Future for ResponseFuture<F> {
             Ok(Async::Ready(())) => {}
             Err(_) => {
                 let status = grpc::Status::with_code(grpc::Code::ResourceExhausted);
-                let mut headers = HeaderMap::new();
-                headers.insert("grpc-message", "Too many active taps".parse().unwrap());
-                return Err(grpc::Error::Grpc(status, headers));
+                return Err(grpc::Error::Grpc(status));
             }
         }
 

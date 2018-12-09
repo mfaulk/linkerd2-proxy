@@ -163,6 +163,11 @@ where
         } = self;
 
         const MAX_IN_FLIGHT: usize = 10_000;
+        const MAX_ROUTE_CONCURRENCY: usize = 10; // TODO based on number Cores
+
+        const EWMA_DEFAULT_RTT: Duration = Duration::from_millis(30);
+        const EWMA_DECAY: Duration = Duration::from_secs(10);
+
         let control_host_and_port = config.control_host_and_port.clone();
 
         info!("using controller at {:?}", control_host_and_port);
@@ -251,7 +256,7 @@ where
                 .push(svc::watch::layer(tls_client_config.clone()))
                 .push(phantom_data::layer())
                 .push(control::add_origin::layer())
-                .push(buffer::layer())
+                .push(buffer::layer(MAX_ROUTE_CONCURRENCY))
                 .push(limit::layer(config.destination_concurrency_limit));
 
             // Because the control client is buffered, we need to be able to
@@ -314,7 +319,8 @@ where
                     .push(client::layer("out"))
                     .push(reconnect::layer())
                     .push(svc::stack_per_request::layer())
-                    .push(normalize_uri::layer());
+                    .push(normalize_uri::layer())
+                    .push(buffer::layer(MAX_ROUTE_CONCURRENCY));
 
                 // A per-`outbound::Endpoint` stack that:
                 //
@@ -325,7 +331,6 @@ where
                 // 4. Routes requests to the correct client (based on the
                 //    request version and headers).
                 let endpoint_stack = client_stack
-                    .push(buffer::layer())
                     .push(settings::router::layer::<Endpoint, _>())
                     .push(orig_proto_upgrade::layer())
                     .push(tap_layer.clone())
@@ -354,14 +359,15 @@ where
                 //   `DstAddr` with a resolver.
                 let dst_stack = endpoint_stack
                     .push(resolve::layer(Resolve::new(resolver)))
-                    .push(balance::layer())
-                    .push(buffer::layer())
+                    .push(balance::layer(EWMA_DEFAULT_RTT, EWMA_DECAY))
+                    .push(buffer::layer(MAX_ROUTE_CONCURRENCY))
                     .push(profiles::router::layer(
                         profile_suffixes,
                         profiles_client,
                         dst_route_layer,
                     ))
-                    .push(header_from_target::layer(super::CANONICAL_DST_HEADER));
+                    .push(header_from_target::layer(super::CANONICAL_DST_HEADER))
+                    .push(buffer::layer(MAX_ROUTE_CONCURRENCY));
 
                 // Routes request using the `DstAddr` extension.
                 //
@@ -373,7 +379,6 @@ where
                 // But for now it's more important to use the request router's
                 // caching logic.
                 let dst_router = dst_stack
-                    .push(buffer::layer())
                     .push(router::layer(|req: &http::Request<_>| {
                         let addr = req.extensions().get::<DstAddr>().cloned();
                         debug!("outbound dst={:?}", addr);
@@ -392,7 +397,8 @@ where
                     .push(map_target::layer(|addr: &Addr| {
                         DstAddr::outbound(addr.clone())
                     }))
-                    .push(canonicalize::layer(dns_resolver));
+                    .push(canonicalize::layer(dns_resolver))
+                    .push(buffer::layer(MAX_ROUTE_CONCURRENCY));
 
                 // Routes requests to an `Addr`:
                 //
@@ -407,9 +413,7 @@ where
                 // 4. Finally, if the Source had an SO_ORIGINAL_DST, this TCP
                 // address is used.
                 let addr_router = addr_stack
-                    .push(buffer::layer())
                     .push(timeout::layer(config.bind_timeout))
-                    .push(limit::layer(MAX_IN_FLIGHT))
                     .push(router::layer(|req: &http::Request<_>| {
                         let addr = super::http_request_authority_addr(req)
                             .or_else(|_| super::http_request_host_addr(req))
@@ -421,7 +425,8 @@ where
                     .make(&router::Config::new("out addr", capacity, max_idle_age))
                     .map(shared::stack)
                     .expect("outbound addr router")
-                    .push(phantom_data::layer());
+                    .push(phantom_data::layer())
+                    .push(limit::layer(MAX_IN_FLIGHT));
 
                 // Instantiates an HTTP service for each `Source` using the
                 // shared `addr_router`. The `Source` is stored in the request's
@@ -476,14 +481,14 @@ where
                 // If there is no `SO_ORIGINAL_DST` for an inbound socket,
                 // `default_fwd_addr` may be used.
                 let endpoint_router = client_stack
-                    .push(buffer::layer())
+                    .push(buffer::layer(MAX_ROUTE_CONCURRENCY))
                     .push(settings::router::layer::<Endpoint, _>())
                     .push(phantom_data::layer())
                     .push(tap_layer)
                     .push(http_metrics::layer::<_, classify::Response>(
                         endpoint_http_metrics,
                     ))
-                    .push(buffer::layer())
+                    .push(buffer::layer(MAX_ROUTE_CONCURRENCY))
                     .push(router::layer(RecognizeEndpoint::new(default_fwd_addr)))
                     .make(&router::Config::new("in endpoint", capacity, max_idle_age))
                     .map(shared::stack)
@@ -511,7 +516,7 @@ where
                 let dst_stack = endpoint_router
                     .push(phantom_data::layer())
                     .push(insert_target::layer())
-                    .push(buffer::layer())
+                    .push(buffer::layer(MAX_ROUTE_CONCURRENCY))
                     .push(profiles::router::layer(
                         profile_suffixes,
                         profiles_client,
@@ -534,8 +539,7 @@ where
                 // 5. Finally, if the Source had an SO_ORIGINAL_DST, this TCP
                 // address is used.
                 let dst_router = dst_stack
-                    .push(buffer::layer())
-                    .push(limit::layer(MAX_IN_FLIGHT))
+                    .push(buffer::layer(MAX_ROUTE_CONCURRENCY))
                     .push(router::layer(|req: &http::Request<_>| {
                         let canonical = req
                             .headers()
@@ -553,7 +557,9 @@ where
                     }))
                     .make(&router::Config::new("in dst", capacity, max_idle_age))
                     .map(shared::stack)
-                    .expect("inbound dst router");
+                    .expect("inbound dst router")
+                    .push(phantom_data::layer())
+                    .push(limit::layer(MAX_IN_FLIGHT));
 
                 // As HTTP requests are accepted, the `Source` connection
                 // metadata is stored on each request's extensions.
@@ -737,6 +743,7 @@ where
     N: svc::MakeService<(), http::Request<tower_h2::RecvBody>, Response = http::Response<B>>
         + Send
         + 'static,
+    <<N as svc::MakeService<(), http::Request<tower_h2::RecvBody>>>::Service as svc::Service<http::Request<tower_h2::RecvBody>>>::Future: Send + 'static,
     tower_h2::server::Connection<Connection, N, ::logging::ServerExecutor, B, ()>:
         Future<Item = ()>,
 {

@@ -1,5 +1,4 @@
 use futures::{Future, Poll, Stream};
-use http::HeaderMap;
 use prost::Message;
 use std::{
     fmt,
@@ -72,7 +71,7 @@ where
     // Coerces the stream's Error<()> to an Error<S::Error>.
     fn coerce_stream_err(e: grpc::Error<()>) -> grpc::Error<S::Error> {
         match e {
-            grpc::Error::Grpc(s, h) => grpc::Error::Grpc(s, h),
+            grpc::Error::Grpc(s) => grpc::Error::Grpc(s),
             grpc::Error::Decode(e) => grpc::Error::Decode(e),
             grpc::Error::Protocol(e) => grpc::Error::Protocol(e),
             grpc::Error::Inner(()) => {
@@ -80,7 +79,7 @@ where
                 // some reason does, we report this as an unknown error.
                 warn!("unexpected gRPC stream error");
                 debug_assert!(false);
-                grpc::Error::Grpc(grpc::Status::with_code(grpc::Code::Unknown), HeaderMap::new())
+                grpc::Error::Grpc(grpc::Status::with_code(grpc::Code::Unknown))
             }
         }
     }

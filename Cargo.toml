@@ -102,11 +102,11 @@ tokio-io = "0.1.6"
 [profile.test]
 debug = false
 
-[patch.'https://github.com/tower-rs/tower']
-tower-balance         = { git = "https://github.com/olix0r/tower", branch = 'ver/balance-defaults' }
-tower-buffer          = { git = "https://github.com/olix0r/tower", branch = 'ver/balance-defaults' }
-tower-discover        = { git = "https://github.com/olix0r/tower", branch = 'ver/balance-defaults' }
-tower-in-flight-limit = { git = "https://github.com/olix0r/tower", branch = 'ver/balance-defaults' }
-tower-reconnect       = { git = "https://github.com/olix0r/tower", branch = 'ver/balance-defaults' }
-tower-service         = { git = "https://github.com/olix0r/tower", branch = 'ver/balance-defaults' }
-tower-util            = { git = "https://github.com/olix0r/tower", branch = 'ver/balance-defaults' }
+[patch."https://github.com/tower-rs/tower"]
+tower-balance         = { git = "https://github.com/olix0r/tower", branch = "ver/balance-defaults" }
+tower-buffer          = { git = "https://github.com/olix0r/tower", branch = "ver/balance-defaults" }
+tower-discover        = { git = "https://github.com/olix0r/tower", branch = "ver/balance-defaults" }
+tower-in-flight-limit = { git = "https://github.com/olix0r/tower", branch = "ver/balance-defaults" }
+tower-reconnect       = { git = "https://github.com/olix0r/tower", branch = "ver/balance-defaults" }
+tower-service         = { git = "https://github.com/olix0r/tower", branch = "ver/balance-defaults" }
+tower-util            = { git = "https://github.com/olix0r/tower", branch = "ver/balance-defaults" }
